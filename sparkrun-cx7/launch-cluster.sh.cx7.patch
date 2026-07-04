@@ -1,0 +1,21 @@
+--- a/launch-cluster.sh
++++ b/launch-cluster.sh
+@@ -465,6 +465,18 @@
+     detect_local_ip || exit 1
+ fi
+ 
++# --- joeai patch: pin cluster coordination to the CX7 direct link ---
++# the two DGX Sparks only mutually route over the CX7 cable (enp1s0f0np0,
++# 192.168.1.x). The stock auto-detect grabs the OOB enP7s7 (192.168.0.x),
++# which the peer can't reach -> the ray GCS hangs forever. Force LOCAL_IP to
++# this host's CX7 IP (no-op if that interface has no address). Re-apply after
++# `sparkrun update` via dashboard/sparkrun/patches/apply.sh.
++__joeai_cx7_ip=$(ip -o -4 addr show enp1s0f0np0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
++if [[ -n "$__joeai_cx7_ip" ]]; then
++    LOCAL_IP="$__joeai_cx7_ip"
++    ETH_IF="enp1s0f0np0"
++fi
++# --- end joeai patch ---
+ HEAD_IP="$LOCAL_IP"
+ 
+ # Verify HEAD_IP is in ALL_NODES

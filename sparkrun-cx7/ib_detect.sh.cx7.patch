@@ -1,0 +1,21 @@
+--- a/ib_detect.sh
++++ b/ib_detect.sh
+@@ -89,7 +89,17 @@
+ fi
+ 
+ # Detect management network interface (default route) and its IP
+-DEFAULT_IF=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
++# joeai patch: prefer the CX7 direct-link iface when it has an IP. On the two
++# Sparks the ONLY inter-node route is the CX7 cable (enp1s0f0np0,
++# 192.168.1.x); the default-route OOB NIC (enP7s7, 192.168.0.x) does NOT route
++# box-to-box. DEFAULT_IF here feeds BOTH DETECTED_SOCKET_IFNAME and
++# DETECTED_MGMT_IP (-> the container NODE_IP vLLM advertises for TP), so pinning
++# it to CX7 fixes the torch-distributed rendezvous AND the node address per-host.
++if ip -4 addr show enp1s0f0np0 2>/dev/null | grep -q "inet "; then
++    DEFAULT_IF=enp1s0f0np0
++else
++    DEFAULT_IF=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
++fi
+ MGMT_IP=$(ip -4 addr show "$DEFAULT_IF" 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)
+ 
+ # Build comma-separated lists

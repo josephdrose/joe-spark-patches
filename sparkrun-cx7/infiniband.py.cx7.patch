@@ -1,0 +1,31 @@
+--- a/infiniband.py
++++ b/infiniband.py
+@@ -167,6 +167,16 @@
+                 seen.add(ifname)
+         return ",".join(parts)
+ 
++    # joeai patch (CX7 cluster, the 2 DGX Sparks): pin inter-node comm to the
++    # rocep1s0f0 / enp1s0f0np0 (192.168.1.x) CX7 link. The default-route OOB NIC
++    # (enP7s7, 192.168.0.x) does NOT route box-to-box. NOTE: the 2nd CX7 port
++    # (roceP2p1s0f0 / 192.168.100.x) pings over TCP but its RoCE data plane
++    # deadlocks NCCL mid-bootstrap; rocep1s0f0 is the proven link. Must run BEFORE
++    # the HCA/SOCKET blocks below that consume these values.
++    if ib_info.get("DETECTED_SOCKET_IFNAME"):
++        ib_info["DETECTED_SOCKET_IFNAME"] = "enp1s0f0np0"
++        ib_info["DETECTED_NET_LIST"] = "enp1s0f0np0"
++        ib_info["DETECTED_HCA_LIST"] = "rocep1s0f0"
+     if ib_info.get("DETECTED_HCA_LIST"):
+         env["NCCL_IB_HCA"] = ib_info["DETECTED_HCA_LIST"]
+     if ib_info.get("DETECTED_SOCKET_IFNAME"):  # prefer MGMT/default interface for non-IB HCA adapters since it works for mesh or non-mesh
+@@ -186,6 +196,11 @@
+ 
+     # add NODE_IP for management interface for ray script compatibility
+     env["NODE_IP"] = ib_info.get("DETECTED_MGMT_IP", "")
++    # joeai patch: vLLM workers must advertise their CX7 IP for the distributed
++    # NCCL data path. Without VLLM_HOST_IP vLLM auto-detects the OOB IP and the
++    # collective deadlocks after NCCL builds QPs (hang at first real transfer).
++    # DETECTED_MGMT_IP is the CX7 IP per-host via the ib_detect.sh patch.
++    env["VLLM_HOST_IP"] = ib_info.get("DETECTED_MGMT_IP", "")
+ 
+     if topology == "ring":
+         env.update(generate_ring_nccl_overrides(ib_info))

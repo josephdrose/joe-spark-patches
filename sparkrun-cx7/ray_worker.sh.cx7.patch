@@ -1,0 +1,20 @@
+--- a/ray_worker.sh
++++ b/ray_worker.sh
+@@ -1,8 +1,15 @@
+ #!/bin/bash
+ set -uo pipefail
+ 
+-# Detect management IP
+-DEFAULT_IF=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+')
++# Detect node IP. joeai patch: prefer the CX7 direct link (enp1s0f0np0) —
++# the two DGX Sparks only mutually route over it; the default-route NIC
++# (enP7s7, 192.168.0.x) is unreachable from the peer and hangs the ray GCS.
++# Falls back to the default route if the CX7 iface has no address.
++if ip -o -4 addr show enp1s0f0np0 2>/dev/null | grep -q inet; then
++    DEFAULT_IF=enp1s0f0np0
++else
++    DEFAULT_IF=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+')
++fi
+ NODE_IP=$(ip -4 addr show "$DEFAULT_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){{3}}' | head -n1)
+ if [ -z "$NODE_IP" ]; then
+     echo "ERROR: Could not detect management IP" >&2
