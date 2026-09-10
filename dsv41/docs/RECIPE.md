@@ -3,8 +3,8 @@
 Target: `deepseek-ai/DeepSeek-V4.1-Flash` at TP=4 on four DGX Sparks, with an
 OpenAI-compatible endpoint on the head node.
 
-Result on this fleet: 314 s load, 620,493 KV tokens, 14.94 tok/s eager and
-61.90 tok/s with DSpark k=5, at 16,384 context.
+Result on this fleet: 391 s load, 476,844 KV tokens, and 46.31 tok/s on one
+stream with CUDA graphs and DSpark k=5, at 16,384 context.
 
 ## 0. Prerequisites
 
@@ -31,11 +31,12 @@ the local copy.
 
 ## 2. Build the image
 
-Two layers. Neither compiles vLLM from source.
+Three layers. None compiles vLLM from source.
 
 ```bash
 ./build/vl41-build-image.sh      # vl41-eng:2
 ./build/vlpage-build-image.sh    # vlpage-eng:3
+./build/vlspeed-build-image.sh   # vlspeed-eng:4
 ```
 
 `vl41-build-image.sh` does five things:
@@ -51,6 +52,11 @@ Two layers. Neither compiles vLLM from source.
 `vlpage-build-image.sh` runs `patch/vlpage-page64.py` against the installed
 tree. That is Python only and takes about one second per box. See
 [page-size-64.md](page-size-64.md).
+
+`vlspeed-build-image.sh` runs `patch/vlspeed-topk.py` and
+`patch/vlspeed-prestage.py`. Python only, about a second per box. Together they
+are what CUDA graphs need. See [engram-prestage.md](engram-prestage.md),
+[topk-swap.md](topk-swap.md) and [cuda-graphs.md](cuda-graphs.md).
 
 Set `WORK` to a path with 20 GiB free. The script defaults to
 `$HOME/cc-scratch/vllm-v41`.
@@ -82,7 +88,7 @@ to 3 rank 0's rows, silently. See [silent-corruption.md](silent-corruption.md).
 
 ## 4. Serve
 
-Edit `launch/vlpage-tp4-4node-up.sh` first:
+Edit `launch/vlspeed-tp4-4node-up.sh` first:
 
 | Variable | Meaning |
 |---|---|
@@ -94,14 +100,17 @@ Edit `launch/vlpage-tp4-4node-up.sh` first:
 Both address arrays ship as RFC 5737 documentation ranges. Replace them.
 
 ```bash
-DRYRUN=1 ./launch/vlpage-tp4-4node-up.sh   # print the per-rank scripts
-DSPARK=5 ./launch/vlpage-tp4-4node-up.sh   # bring up
+DRYRUN=1 ./launch/vlspeed-tp4-4node-up.sh                  # print the per-rank scripts
+DSPARK=5 GPU_UTIL=0.78 ./launch/vlspeed-tp4-4node-up.sh    # bring up
 ```
 
 The script starts ranks 3, 2 and 1 headless, then rank 0. It polls
-`/v1/models` on the head for up to 30 minutes. Load takes 314 s here.
+`/v1/models` on the head for up to 30 minutes. Load takes 391 s here.
 
 `DSPARK` must be a multiple of 5. See [spec-decode.md](spec-decode.md).
+
+CUDA graphs are on by default. `EAGER=1` turns them off, and the launcher then
+drops the graph flags with them. See [cuda-graphs.md](cuda-graphs.md).
 
 ## 5. Confirm
 

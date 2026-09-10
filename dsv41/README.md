@@ -5,10 +5,12 @@ Run date 2026-09-10.
 
 `deepseek-ai/DeepSeek-V4.1-Flash` is 475.25 GiB of weights. Four DGX Sparks hold
 121.7 GiB each. At TP=4 that is 118.81 GiB per rank against 121.7 GiB physical.
-This directory holds the four changes that make the model fit and serve.
+This directory holds the seven changes that make the model fit, serve, and run
+with CUDA graphs.
 
-The recipe ports no kernel and compiles no vLLM from source. The image build
-takes 12.8 seconds.
+The recipe ports no kernel and compiles no vLLM from source. The layer that
+compiles the op shim takes 12.8 seconds. The two Python layers take about a
+second each.
 
 ## Hardware
 
@@ -55,16 +57,30 @@ Every number below comes from one serve on this fleet.
 |---|---|
 | Endpoint | `spark-2:8410`, served model `deepseek-v41-flash` |
 | Fingerprint | `vllm-0.28.1rc1.dev391+g29af8bd67-tp4` |
-| Weights resident | 78.95 GiB per rank |
-| Load time | 314 s |
-| KV cache | 620,493 tokens at 13.04 GiB |
+| Image | `vlspeed-eng:4` |
+| Weights resident | 81.36 GiB per rank, with the DSpark draft layers |
+| Load time | 391 s |
+| CUDA graphs | on. 0.30 GiB captured in 4 s |
+| KV cache | 476,844 tokens at 9.03 GiB |
 | Context | 16,384 |
-| Graphs | off, `--enforce-eager` |
-| Decode, eager | 14.94 tok/s |
-| Decode, DSpark k=5 | 61.90 tok/s |
+| Concurrency | 29.1x at 16,384 |
+| Host memory free while serving | 7 to 9 GiB per box |
 
-Both throughput figures use the same prompt. A 3,853-token prompt was answered
-correctly.
+Speed, DSpark k=5, `--max-num-seqs 4`, gmu 0.78. C1 is one stream, C4 is four.
+The aggregate is the mean over 8 categories with counting excluded. All figures
+are tok/s.
+
+| Config | C1 agg | C4 agg | Counting C1 |
+|---|--:|--:|--:|
+| Eager | 40.15 | 95.15 | 72.07 |
+| **CUDA graphs** | **46.31** | **97.98** | **85.19** |
+
+Run-to-run spread is about 2%. Confirmed by hand on the final serve: 70.52 tok/s
+single stream on a counting prompt, 206 tokens in 2.92 s, `finish_reason: stop`.
+The full table, including k=10 and 8K prefill, is in
+[docs/cuda-graphs.md](docs/cuda-graphs.md).
+
+A 3,853-token prompt was answered correctly.
 
 Verified output:
 
@@ -94,24 +110,25 @@ Read [docs/RECIPE.md](docs/RECIPE.md) for the full sequence. The short form:
 # 1. Stage the checkpoint on all four boxes, 475 GiB each.
 #    Pin revision df42c109f1defefcbfcedbe7d905718a12266e40.
 
-# 2. Build the image. Two layers, no compile from source.
+# 2. Build the image. Three layers, no compile of vLLM from source.
 ./build/vl41-build-image.sh        # vl41-eng:2
 ./build/vlpage-build-image.sh      # vlpage-eng:3
+./build/vlspeed-build-image.sh     # vlspeed-eng:4
 
 # 3. Build each rank's Engram row files. Run per box, per layer.
 python3 tests/build_real_engram_table.py --out $HOME/table --layer 1 --rank 0
 python3 tests/build_real_engram_table.py --out $HOME/table --layer 14 --rank 0
 
 # 4. Serve. Edit NODE_TS and NODE_LAN first.
-DSPARK=5 ./launch/vlpage-tp4-4node-up.sh
+DSPARK=5 GPU_UTIL=0.78 ./launch/vlspeed-tp4-4node-up.sh
 ```
 
-The IP addresses in `launch/vlpage-tp4-4node-up.sh` are RFC 5737 documentation
+The IP addresses in `launch/vlspeed-tp4-4node-up.sh` are RFC 5737 documentation
 ranges. Replace them with your own. Host paths use `$HOME`.
 
 ## What had to be fixed
 
-Four changes, in boot order. Each document states the failure verbatim, the
+Seven changes, in boot order. Each document states the failure verbatim, the
 cause, and the change.
 
 | # | Problem | Fix | Document |
@@ -120,6 +137,9 @@ cause, and the change.
 | 2 | No aarch64 vLLM wheel exists for PR #56214. A from-source build costs hours. | Take the official wheel for the PR's parent commit. Copy the PR's 87 changed `vllm/*.py` on top. | [image-build.md](docs/image-build.md) |
 | 3 | The PR widens three op schemas with `apply_q_norm`. The parent wheel's `_C` has no such argument. | Compile the PR's own `.cu` out of tree for sm_121. Register it as `torch.ops.vl41`. | [op-shim-apply-q-norm.md](docs/op-shim-apply-q-norm.md) |
 | 4 | `SM120 sparse-MLA has no decode kernel for this shape ... page_block_size=32`. | Put every KV page on 64 states. Three spec changes in Python. | [page-size-64.md](docs/page-size-64.md) |
+| 5 | The decode step costs 83 ms eager. Dropping `--enforce-eager` raises, because the disk read sits inside the forward. | Stage the rows first, then capture with exact DSpark batch sizes. Worth 1.15x. | [cuda-graphs.md](docs/cuda-graphs.md) |
+| 6 | `prepare_embeddings` reads NVMe inside the forward, so the forward holds a host call. | Read the rows in `prepare_inputs` instead, both layers in parallel. | [engram-prestage.md](docs/engram-prestage.md) |
+| 7 | `persistent_topk` is reported to die on GB10 at a 1M-wide logits buffer. It never failed here. | Route sm12x decode to `top_k_per_row_decode`. Insurance for long context. | [topk-swap.md](docs/topk-swap.md) |
 
 Three further documents cover the rest:
 
@@ -135,19 +155,20 @@ Three further documents cover the rest:
 
 State of the work on 2026-09-10. Nothing below was measured.
 
-- **Quality.** No benchmark and no evaluation run. Four correct prompts do not
-  measure quality.
-- **Engram hash ids.** The reader was verified against the checkpoint. See
-  below. Nothing checked that the model computes the right row ids:
-  `rolling % prime[h] + offset[h]`, the compressed token map, or
-  `EngramLayout.offsets`. A wrong id reads a correct row and raises nothing.
-- **Engram behaviour inside a served forward pass.** The reader was checked
-  outside vLLM, in a second process, against a quiet disk. Nothing read the live
-  module instance or ran the reader under the serve's own load.
-- **CUDA graphs.** Every run used `--enforce-eager`. In progress.
-- **Concurrency.** One stream only.
-- **Context past 16,384.** The KV pool holds 620,493 tokens. No long prompt was
-  run.
+- **Quality.** No benchmark and no evaluation run. No greedy reference, no
+  garble gate, no needle test. Four correct prompts do not measure quality.
+- **Engram hash ids.** The reader was verified against the checkpoint, and the
+  staged rows were verified inside the serve. Both are below. Neither checks
+  that the model computes the right row ids: `rolling % prime[h] + offset[h]`,
+  the compressed token map, or `EngramLayout.offsets`. A wrong id reads a
+  correct row and raises nothing.
+- **Context past 16,384.** Every run was at 16,384. Nothing exercised the KV
+  pool at 300K or 1M, the `persistent_topk` failure mode, or FlashInfer #5015.
+- **Concurrency above 4.** The bench ran 1, 2 and 4 streams.
+- **That every decode batch hit an exact FULL graph.** The capture sizes were
+  derived. No per-batch trace confirmed them.
+- **DSpark k other than 5 and 10.**
+- **This prestage against the prior art's, head to head.**
 - **Vision.** The vision path was never exercised.
 
 ## Engram reader, verified
@@ -180,6 +201,19 @@ The comparison is index-sensitive at one-row granularity.
 144 rows of 768,022,850 is seam coverage. It does not detect sparse random
 corruption.
 
+## Staged rows inside the serve, verified
+
+One boot at `VL41_ENGRAM_PRESTAGE_VERIFY=2000` made `prepare_embeddings` redo
+the lookup inside the forward and compare bitwise against the staged rows. All
+four ranks: 2,000 lookups, 41,698 token-rows, 0 mismatches.
+
+The 2,000 calls covered single-stream decode, 4 concurrent streams, an
+8,427-token chunked prefill, and DSpark verification batches.
+
+This proves the two hashes agree and the rows land in the right buffer. It
+proves nothing about whether either hash is the right hash. See
+[docs/engram-prestage.md](docs/engram-prestage.md).
+
 ## Layout
 
 | Path | Contents |
@@ -187,7 +221,7 @@ corruption.
 | `docs/RECIPE.md` | Bare fleet to serving endpoint, in order |
 | `docs/*.md` | One file per fix |
 | `patch/` | The exact files, with `md5sums.txt` and `mounts.txt` |
-| `build/` | The two image layers |
+| `build/` | The three image layers |
 | `launch/` | The 4-node bring-up script |
 | `tests/` | The harness, the negative controls, the table builder |
 
@@ -198,8 +232,8 @@ corruption.
 - **tonyd2wild** and **Kai** for
   [DeepSeek-V4.1-Flash-vLLM-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark).
   They reached the same three KV-spec changes independently. We found their
-  repository after deriving ours. Their repository also carries `persistent_topk`
-  and CUDA-graph prestage work that this one does not.
+  repository after deriving ours. Fixes 5, 6 and 7 here take their graph flags,
+  their `model_state.py` wiring and their `sparse_attn_indexer.py` edit.
 - **eugr / local-inference-lab** for the b12x sm120 and sm121 kernels. The base
   image is theirs. Without it nothing here runs.
 

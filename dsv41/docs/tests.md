@@ -23,6 +23,7 @@ The work tree must sit on a real filesystem. `tmpfs` rejects `O_DIRECT` at open.
 | `engram_disk_harness.py` | ALL PASS |
 | `negative_control.py` | ALL PASS, 6 of 6 controls fired |
 | `config_checks.py` | ALL PASS |
+| `engram_graph_capture.py` | 3 of 3 PASS |
 
 **The one failure imports `vllm.models.deepseek_v4_1.nvidia`.** That is a PR
 module the harness does not fetch. The failure predates this work and is
@@ -38,6 +39,9 @@ unrelated to it.
 | `config_checks.py` | The `EngramConfig` fields and `compute_hash` |
 | `conftest.py` | Registers the PR modules under `vllm.*`, since the base image predates the PR |
 | `build_real_engram_table.py` | Builds one rank's real shard, and checks it against the checkpoint tensors |
+| `engram_graph_capture.py` | That the Engram forward captures with the table on NVMe, that a replay reads rows staged after capture, and what a background gather costs a replay |
+| `engram_selftest.py` | The reference `Engram` path on real hardware: layout, hashes, fp8 GEMM, the gate, and the stock model self-test |
+| `engram-selftest.sh` | Fetches DeepSeek's reference `inference/` tree and runs either of those two in a container |
 
 ## The negative controls
 
@@ -67,11 +71,8 @@ clean in the tail of the log.
 
 ## What the tests do not cover
 
-- The Engram lookup inside a served vLLM forward pass. Nothing compared it to a
-  reference there.
 - Quality. No benchmark and no evaluation run.
-- CUDA graphs. Every serve used `--enforce-eager`.
-- Concurrency at the endpoint. One stream only.
+- Concurrency at the endpoint above 4 streams. The bench ran 1, 2 and 4.
 - Context past 16,384.
 - The vision path.
 - The rank row offset. That was checked by reading the code. No test covers it.

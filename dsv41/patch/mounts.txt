@@ -64,7 +64,31 @@ build/vl41-build-image.sh  edits  $VLLM/models/deepseek_v4_1/attention.py
 
 
 # ---------------------------------------------------------------------------
-# 5. Host mounts made by launch/vlpage-tp4-4node-up.sh
+# 5. vlspeed-topk.py
+#    An in-place editor. It drops no file. Run it against an installed tree:
+#      python3 vlspeed-topk.py /usr/local/lib/python3.12/dist-packages/vllm
+#    Applied by build/vlspeed-build-image.sh. The substitution asserts its
+#    occurrence count, so a version drift fails loudly.
+# ---------------------------------------------------------------------------
+vlspeed-topk.py  edits  $VLLM/model_executor/layers/sparse_attn_indexer.py   (1 edit)
+
+
+# ---------------------------------------------------------------------------
+# 6. vlspeed-prestage.py
+#    An in-place editor. It drops no file. Run it against an installed tree:
+#      python3 vlspeed-prestage.py /usr/local/lib/python3.12/dist-packages/vllm
+#    Applied by build/vlspeed-build-image.sh, after vlspeed-topk.py. It edits
+#    the engram.py that engram-disk-table.patch already produced, so the order
+#    of the two build layers is load-bearing. Every substitution asserts its
+#    occurrence count.
+# ---------------------------------------------------------------------------
+vlspeed-prestage.py  edits   $VLLM/models/deepseek_v4_1/common/engram.py       (2 edits)
+vlspeed-prestage.py  appends $VLLM/models/deepseek_v4_1/common/engram.py       (EngramDiskStager)
+vlspeed-prestage.py  edits   $VLLM/models/deepseek_v4_1/nvidia/model_state.py  (3 edits)
+
+
+# ---------------------------------------------------------------------------
+# 7. Host mounts made by launch/vlspeed-tp4-4node-up.sh
 # ---------------------------------------------------------------------------
 $TABLE_HOST                     ->  /table            this rank's two Engram row files
 $HOME/.cache/huggingface        ->  /cache/huggingface
