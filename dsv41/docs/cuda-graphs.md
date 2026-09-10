@@ -101,7 +101,7 @@ All figures are tok/s.
 Run-to-run spread is about 2%.
 
 Graphs are worth 1.15x on the mixed set. Capture cost 0.30 GiB and 4 s on that
-serve. At `CTX=1048576` the graph pool is 0.44 GiB.
+serve. At the default 1,048,576 the graph pool is 0.44 GiB.
 
 ## Why the gain here is 1.15x
 

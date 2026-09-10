@@ -15,7 +15,7 @@ d1a313dd092381b92267a25442f4a750  patch/vl41-ops-build.py
 6ad42a07e5cdfccd2277456e7c357116  build/vl41-build-image.sh
 d0daa53c809fc88d56c4b554f7468d31  build/vlpage-build-image.sh
 dea76b723a45cdf4a46e7e914e331324  build/vlspeed-build-image.sh
-fd31a9ecc4d3c2fb011de5e9192c1a39  launch/vlspeed-tp4-4node-up.sh
+4e93fbbf22f10c93f9b84f285356a240  launch/vlspeed-tp4-4node-up.sh
 f4a03f610e414073e3bd12f121e61adf  tests/build_real_engram_table.py
 25527a0dd1566b72434049aa91338a06  tests/check_engram_disk.sh
 33c57593715fa40b53902bda6bcf555d  tests/config_checks.py

@@ -64,6 +64,8 @@ on. They differ in `--max-model-len`.
 
 ### At 16,384 context
 
+Bring this one up with `CTX=16384`.
+
 | Item | Value |
 |---|---|
 | Load time | 391 s |
@@ -89,7 +91,7 @@ A 3,853-token prompt was answered correctly.
 
 ### At 1,048,576 context
 
-Read from the live serve. Bring it up with `CTX=1048576`.
+This is the launcher default. Read from the live serve.
 
 | Item | Value |
 |---|---|
@@ -157,12 +159,12 @@ python3 tests/build_real_engram_table.py --out $HOME/table --layer 1 --rank 0
 python3 tests/build_real_engram_table.py --out $HOME/table --layer 14 --rank 0
 
 # 4. Serve. Edit NODE_TS and NODE_LAN first.
-DSPARK=5 ./launch/vlspeed-tp4-4node-up.sh                  # 16,384 context
-DSPARK=5 CTX=1048576 ./launch/vlspeed-tp4-4node-up.sh      # full window
+DSPARK=5 ./launch/vlspeed-tp4-4node-up.sh                  # 1,048,576, the default
+DSPARK=5 CTX=16384 ./launch/vlspeed-tp4-4node-up.sh        # 16,384
 ```
 
-The speed table above was measured at the first command. The needle table and
-the 1M pool figures were measured at the second.
+The needle table and the 1M pool figures were measured at the first command.
+The speed table was measured at the second.
 
 The IP addresses in `launch/vlspeed-tp4-4node-up.sh` are RFC 5737 documentation
 ranges. Replace them with your own. Host paths use `$HOME`.

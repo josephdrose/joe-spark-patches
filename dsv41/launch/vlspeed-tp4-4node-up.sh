@@ -44,7 +44,7 @@ MASTER_PORT="${MASTER_PORT:-25410}"
 NAME="${NAME:-vlspeed-tp4}"
 
 TP="${TP:-4}"
-CTX="${CTX:-16384}"
+CTX="${CTX:-1048576}"           # the full window. CTX=16384 reproduces the speed table.
 GPU_UTIL="${GPU_UTIL:-0.78}"
 MAXSEQS="${MAXSEQS:-4}"
 MAXBATCH="${MAXBATCH:-4096}"
