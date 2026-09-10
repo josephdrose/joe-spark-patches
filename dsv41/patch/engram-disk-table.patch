@@ -1,0 +1,1177 @@
+diff --git a/tests/kernels/test_engram.py b/tests/kernels/test_engram.py
+index f7aa6dd..f304443 100644
+--- a/tests/kernels/test_engram.py
++++ b/tests/kernels/test_engram.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import bisect
++import os
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -12,6 +13,10 @@ from vllm.models.deepseek_v4_1.common.engram import (
+     NgramHashState,
+     ParallelEngramEmbedding,
+ )
++from vllm.models.deepseek_v4_1.common.engram_disk import (
++    DiskEngramTable,
++    build_row_file,
++)
+ from vllm.platforms import current_platform
+ 
+ 
+@@ -536,6 +541,8 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
+     layer.n_hash_cols = layer.part_n_hash_cols = 24
+     layer.head_start = 0
+     layer.cpu_offload = cpu_offload
++    layer.table_path = None
++    layer._pending = None
+     layer.part_num_embeddings = rows
+     # A window strictly inside the table, so unowned rows are exercised too.
+     layer.vocab_start_idx, layer.vocab_end_idx = rows // 4, rows // 4 + rows // 2
+@@ -559,6 +566,43 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
+     return layer
+ 
+ 
++def _attach_disk_table(layer, table_dir):
++    """Switch an embedding to a disk copy of the rows it already holds.
++
++    Row count comes from the weight, not `part_num_embeddings`: `_make_embedding`
++    sets the latter to the whole table so it can draw ids outside the window.
++    """
++    path = os.path.join(str(table_dir), "engram.bin")
++    build_row_file(path, layer.weight, layer.weight_scale_inv, layer.block_size)
++    layer.table_path = str(table_dir)
++    layer._table = DiskEngramTable(
++        path,
++        layer.dim,
++        row_start=layer.vocab_start_idx,
++        row_count=layer.weight.shape[0],
++        block_size=layer.block_size,
++    )
++    return layer
++
++
++def _count_gathers(layer):
++    """Count the synchronous reads a lookup does, returning the live list.
++
++    Every prefetch assertion below compares values, and the fallback read
++    returns the same values, so a `prefetch` that quietly did nothing would
++    pass all of them. This is what separates the two paths.
++    """
++    calls = []
++    original = layer._table.gather
++
++    def counted(indices):
++        calls.append(indices)
++        return original(indices)
++
++    layer._table.gather = counted
++    return calls
++
++
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+ @pytest.mark.parametrize("cpu_offload", [False, True])
+ @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@@ -636,6 +680,72 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
+         )
+ 
+ 
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++@pytest.mark.parametrize("prefetch", [False, True])
++@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
++def test_engram_disk_head_shards_reconstruct_checkpoint(
++    prefetch, tp_size, monkeypatch, tmp_path
++):
++    """The disk weight loader must write the same head buckets the resident
++    loader keeps, so an all-gather over disk-backed ranks still rebuilds
++    checkpoint head order, TP padding and empty owners included.
++
++    Run twice over the same ranks: reading in the lookup, and reading from a
++    prefetch issued first. A rank that owns no heads has nothing to prefetch,
++    which is the case the `None` branch of `_local_cols` exists for."""
++    head_sizes = (17, 19, 23, 29, 31, 37)
++    num_rows, dim = sum(head_sizes), 64
++    torch.manual_seed(0)
++    weight = torch.randn(num_rows + 7, dim).to(torch.float8_e4m3fn)
++    scales = torch.randint(120, 134, (num_rows + 7, dim // 32), dtype=torch.uint8)
++    ids = torch.empty(7, len(head_sizes), dtype=torch.int32, device="cuda")
++    start = 0
++    for head, size in enumerate(head_sizes):
++        ids[:, head].random_(start, start + size)
++        ids[0, head] = start
++        ids[-1, head] = start + size - 1
++        start += size
++    expected = _reference_lookup(weight.cuda(), scales.cuda(), ids, 0, num_rows)
++    monkeypatch.setattr(
++        engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
++    )
++    shards = []
++    layers = []
++    for rank in range(tp_size):
++        monkeypatch.setattr(
++            engram_ops, "get_tensor_model_parallel_rank", lambda rank=rank: rank
++        )
++        with torch.device("cuda"):
++            layer = ParallelEngramEmbedding(
++                num_rows + 7, dim, head_sizes, table_path=str(tmp_path)
++            )
++        layer.weight.weight_loader(layer.weight, weight)
++        layer.weight_scale_inv.weight_loader(
++            layer.weight_scale_inv, scales.view(torch.float8_e8m0fnu)
++        )
++        # Nothing resident: the rows only ever exist in the file.
++        assert layer.weight.numel() == 0 and layer.weight_scale_inv.numel() == 0
++        assert os.path.getsize(layer._row_file) == layer.part_num_embeddings * (
++            dim + dim // 32
++        )
++        out = torch.empty(
++            len(ids),
++            layer.part_n_hash_cols,
++            dim,
++            device="cuda",
++            dtype=torch.bfloat16,
++        )
++        if prefetch:
++            layer.prefetch(ids)
++        layer.lookup(ids, out)
++        shards.append(out)
++        layers.append(layer)
++    gathered = torch.cat(shards, dim=1)
++    torch.testing.assert_close(gathered[:, : len(head_sizes)], expected, rtol=0, atol=0)
++    assert torch.count_nonzero(gathered[:, len(head_sizes) :]) == 0
++    assert sum(layer.part_num_embeddings for layer in layers) == num_rows
++
++
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+ @pytest.mark.parametrize("cpu_offload", [False, True])
+ @pytest.mark.parametrize("background", [False, True])
+@@ -659,6 +769,275 @@ def test_engram_lookup_matches_torch(cpu_offload, background, num_tokens):
+     assert torch.equal(out, expected)
+ 
+ 
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++@pytest.mark.parametrize("num_tokens", [1, 7, 256])
++def test_engram_disk_lookup_matches_resident(num_tokens, tmp_path):
++    """The on-disk table must return the same bits as the resident one: same
++    rows, same ue8m0 decode (its byte is the fp32 exponent field, so byte 0 is
++    0.0 and not 2**-127), and the same zeros for rows another TP rank owns."""
++    layer = _make_embedding(False)
++    # Byte 0 is where a float8_e8m0fnu cast (2**-127) and the exponent-field
++    # decode (0.0) disagree, and the fixture's 120..133 band never covers it.
++    layer.weight_scale_inv[::7] = 0
++    cols, rows = 24, layer.part_num_embeddings
++    ids = torch.randint(0, rows, (num_tokens, cols), dtype=torch.int32, device="cuda")
++    shape = (num_tokens, cols, layer.dim)
++    resident = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, resident)
++    disk = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    _attach_disk_table(layer, tmp_path).lookup(ids, disk)
++    assert torch.equal(disk, resident)
++    assert torch.count_nonzero(resident), "both paths returned zeros"
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++@pytest.mark.parametrize("num_tokens", [1, 7, 256])
++def test_engram_disk_prefetch_matches_lookup(num_tokens, tmp_path):
++    """Starting the read early must not change one bit of the result, and the
++    rows must actually come from it: the counter proves the lookup did not
++    quietly read them again."""
++    layer = _attach_disk_table(_make_embedding(False), tmp_path)
++    cols = 24
++    ids = torch.randint(
++        0, layer.part_num_embeddings, (num_tokens, cols), dtype=torch.int32,
++        device="cuda",
++    )
++    shape = (num_tokens, cols, layer.dim)
++    plain = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, plain)
++
++    gathers = _count_gathers(layer)
++    layer.prefetch(ids)
++    prefetched = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, prefetched)
++    assert not gathers, "the prefetched rows were read a second time"
++    assert torch.equal(prefetched, plain)
++    assert torch.count_nonzero(plain), "both paths returned zeros"
++
++    # The entry is consumed, not reusable: a second lookup reads for itself.
++    again = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, again)
++    assert len(gathers) == 1
++    assert torch.equal(again, plain)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++def test_engram_disk_prefetched_rows_are_never_served_for_other_ids(tmp_path):
++    """Rows read for one id set must never reach a lookup for another.
++
++    The two sets share shape, dtype and device, so the ids are the only thing
++    separating them: a match keyed on shape, on arrival order or on a step
++    counter fails here.
++    """
++    layer = _attach_disk_table(_make_embedding(False), tmp_path)
++    cols, rows, tokens = 24, layer.part_num_embeddings, 8
++    a = torch.randint(0, rows, (tokens, cols), dtype=torch.int32, device="cuda")
++    b = torch.randint(0, rows, (tokens, cols), dtype=torch.int32, device="cuda")
++    shape = (tokens, cols, layer.dim)
++    want_a = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    want_b = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(a, want_a)
++    layer.lookup(b, want_b)
++    assert not torch.equal(want_a, want_b), "the two id sets gave the same rows"
++
++    gathers = _count_gathers(layer)
++    got = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.prefetch(a)
++    layer.lookup(b, got)
++    assert torch.equal(got, want_b)
++    assert len(gathers) == 1, "the mismatched lookup did not read for itself"
++
++    # And the mismatched entry is gone, not left for a later step to match.
++    layer.lookup(a, got)
++    assert torch.equal(got, want_a)
++    assert len(gathers) == 2
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++def test_engram_disk_prefetch_copies_the_ids_it_keys_on(tmp_path):
++    """A caller may hand over a buffer it refills. The key has to be a copy:
++    matching the buffer's new contents would serve the old contents' rows."""
++    layer = _attach_disk_table(_make_embedding(False), tmp_path)
++    cols, rows, tokens = 24, layer.part_num_embeddings, 8
++    buf = torch.randint(0, rows, (tokens, cols), dtype=torch.int32)
++    later = torch.randint(0, rows, (tokens, cols), dtype=torch.int32)
++    shape = (tokens, cols, layer.dim)
++    want = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(later, want)
++
++    layer.prefetch(buf)
++    buf.copy_(later)
++    got = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(buf, got)
++    assert torch.equal(got, want)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++def test_engram_disk_cancel_prefetch(tmp_path):
++    """A step that is not going to run must leave nothing behind."""
++    layer = _attach_disk_table(_make_embedding(False), tmp_path)
++    cols, rows, tokens = 24, layer.part_num_embeddings, 8
++    ids = torch.randint(0, rows, (tokens, cols), dtype=torch.int32, device="cuda")
++    shape = (tokens, cols, layer.dim)
++    want = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, want)
++
++    gathers = _count_gathers(layer)
++    layer.prefetch(ids)
++    layer.cancel_prefetch()
++    got = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, got)
++    assert len(gathers) == 1, "a cancelled prefetch was still consumed"
++    assert torch.equal(got, want)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++@pytest.mark.parametrize("cpu_offload", [False, True])
++def test_engram_prefetch_is_inert_for_resident_tables(cpu_offload):
++    """The hook is on every table. With the rows in HBM or in pinned memory
++    there is nothing to start early, and the lookup must be untouched."""
++    layer = _make_embedding(cpu_offload)
++    cols, tokens = 24, 7
++    ids = torch.randint(
++        0, layer.part_num_embeddings, (tokens, cols), dtype=torch.int32, device="cuda"
++    )
++    expected = _reference_lookup(
++        layer.weight.cuda(),
++        layer.weight_scale_inv.cuda(),
++        ids,
++        layer.vocab_start_idx,
++        layer.vocab_end_idx,
++    )
++    out = torch.empty(tokens, cols, layer.dim, dtype=torch.bfloat16, device="cuda")
++    layer.prefetch(ids)
++    layer.lookup(ids, out)
++    assert torch.equal(out, expected)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++@pytest.mark.parametrize("prefetch", [False, True])
++def test_engram_disk_prepare_embeddings_uses_the_prefetch(prefetch, tmp_path):
++    """`Engram.prefetch` then `prepare_embeddings` must stage exactly what
++    `prepare_embeddings` stages alone, which is what the resident table gives."""
++    layer = _make_embedding(False)
++    cols, tokens = 24, 4
++    ids = torch.randint(
++        0, layer.part_num_embeddings, (tokens, cols), dtype=torch.int32, device="cuda"
++    )
++    expected = torch.empty(tokens, cols, layer.dim, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, expected)
++    _attach_disk_table(layer, tmp_path)
++
++    module = Engram.__new__(Engram)
++    torch.nn.Module.__init__(module)
++    module.embed_tokens = layer
++    module.use_sequence_parallel = False
++    module.staged_rows = torch.empty_like(expected)
++    gathers = _count_gathers(layer)
++    if prefetch:
++        module.prefetch(ids)
++    module.prepare_embeddings(ids)
++    assert len(gathers) == (0 if prefetch else 1)
++    assert torch.equal(module.embed(ids), expected)
++    assert torch.count_nonzero(expected), "the table returned zeros"
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++def test_engram_disk_prefetch_refuses_graph_capture(tmp_path):
++    """Same reason the lookup refuses: the read is issued by the CPU, and the
++    ids have to reach it, neither of which capture can record."""
++    layer = _attach_disk_table(_make_embedding(False), tmp_path)
++    ids = torch.randint(
++        0, layer.part_num_embeddings, (8, 24), dtype=torch.int32, device="cuda"
++    )
++    out = torch.empty(8, 24, layer.dim, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, out)
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.stream(stream):
++        graph.capture_begin()
++        try:
++            with pytest.raises(RuntimeError, match="CUDA graph"):
++                layer.prefetch(ids)
++        finally:
++            graph.capture_end()
++    torch.cuda.current_stream().wait_stream(stream)
++    assert layer._pending is None
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++def test_engram_disk_rows_replay_from_the_staging_buffer(tmp_path):
++    """The read cannot be captured, but the consumer of its rows can.
++
++    This is the shape a disk-backed serve has to use: stage the rows outside
++    the captured region, then capture only the arithmetic that reads them.
++    The graph must observe rows written into the buffer AFTER capture, or a
++    replay would serve whatever was live when it was recorded.
++    """
++    layer = _attach_disk_table(_make_embedding(False), tmp_path)
++    cols, rows, tokens = 24, layer.weight.shape[0], 4
++    ids = torch.randint(0, rows, (tokens, cols), dtype=torch.int32, device="cuda")
++    other = torch.randint(0, rows, (tokens, cols), dtype=torch.int32, device="cuda")
++    staged = torch.empty(tokens, cols, layer.dim, dtype=torch.bfloat16, device="cuda")
++
++    def consume():
++        # Stand-in for the wkv projection: any arithmetic over the staged rows.
++        return (staged.float() * 2.0 + 1.0).to(torch.bfloat16)
++
++    layer.lookup(ids, staged)
++    eager = consume().clone()
++
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(stream):
++        for _ in range(3):
++            consume()
++    torch.cuda.current_stream().wait_stream(stream)
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        captured = consume()
++    graph.replay()
++    torch.cuda.synchronize()
++    assert torch.equal(captured, eager)
++
++    # Different ids, staged in place after capture: the replay must follow the
++    # buffer contents, not a snapshot taken when the graph was recorded.
++    layer.lookup(other, staged)
++    expected = consume().clone()
++    layer.lookup(other, staged)
++    graph.replay()
++    torch.cuda.synchronize()
++    assert torch.equal(captured, expected)
++    assert not torch.equal(expected, eager), "the two id sets gave the same rows"
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++def test_engram_disk_lookup_refuses_graph_capture(tmp_path):
++    """A disk read is issued by the CPU, so capture would record the copy at
++    most and every replay would serve the rows captured with it. Fail instead."""
++    layer = _attach_disk_table(_make_embedding(False), tmp_path)
++    ids = torch.randint(
++        0, layer.part_num_embeddings, (8, 24), dtype=torch.int32, device="cuda"
++    )
++    out = torch.empty(8, 24, layer.dim, dtype=torch.bfloat16, device="cuda")
++    layer.lookup(ids, out)
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.stream(stream):
++        graph.capture_begin()
++        try:
++            with pytest.raises(RuntimeError, match="CUDA graph"):
++                layer.lookup(ids, out)
++        finally:
++            # Always close the capture, or every later test on this device
++            # runs inside it.
++            graph.capture_end()
++    torch.cuda.current_stream().wait_stream(stream)
++
++
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+ @pytest.mark.parametrize("cpu_offload", [False, True])
+ @pytest.mark.parametrize("capture", ["eager", "full", "breakable"])
+diff --git a/vllm/config/engram.py b/vllm/config/engram.py
+index a3749c6..96a101c 100644
+--- a/vllm/config/engram.py
++++ b/vllm/config/engram.py
+@@ -27,6 +27,24 @@ class EngramConfig:
+     Each rank offloads its assigned hash heads, so host table storage and
+     lookup traffic scale with the number of heads assigned to the rank."""
+ 
++    table_path: str | None = None
++    """Directory to hold the embedding weights on local disk. Each rank writes
++    its assigned hash heads there while loading and reads rows back on every
++    lookup, so neither device nor host memory holds the table. Set this on
++    hosts where the CPU and the accelerator share one physical memory pool and
++    `cpu_offload` therefore frees nothing. Takes precedence over
++    `cpu_offload`, which is ignored when this is set."""
++
++    disk_read_threads: int = 12
++    """Threads reading the on-disk table. Lookups are latency bound on
++    independent rows, so this is the read queue depth. Unused without
++    `table_path`."""
++
++    disk_direct_io: bool = True
++    """Read the on-disk table with O_DIRECT, so its pages do not evict
++    anything through the page cache. Filesystems that reject O_DIRECT fall
++    back to buffered reads with a warning. Unused without `table_path`."""
++
+     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
+         """Reject Engram configuration for models without n-gram embeddings."""
+         from vllm.platforms import current_platform
+@@ -51,4 +69,9 @@ class EngramConfig:
+ 
+     def compute_hash(self) -> str:
+         """Hash settings that affect embedding execution and graph structure."""
+-        return hash_factors(get_hash_factors(self, set()))
++        factors = get_hash_factors(self, {"table_path"})
++        # Whether the table is on disk changes how a lookup executes, but the
++        # directory it sits in does not, and hashing a path that is often
++        # fresh per run would miss the compile cache every time.
++        factors["disk_backed"] = self.table_path is not None
++        return hash_factors(factors)
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index f30c3a5..4aa23f7 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -32,8 +32,19 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
+   runner's CPU token table holds placeholders for generated tokens under
+   async scheduling, so it passes prompt positions only and keeps the slot
+   cache for the rest.
++
++A disk-backed table (``EngramConfig.table_path``) reads its rows on the CPU,
++so its lookup blocks the step it runs in. ``Engram.prefetch`` starts that read
++early and ``prepare_embeddings`` takes the rows from it, but only when they
++were issued for exactly the ids it is asked for. Nothing calls it yet: the
++hash ids come out of a Triton kernel inside the model's forward, so a caller
++that wants them beforehand has to either run ``NgramHashState`` itself before
++that forward and copy the ids to the host, or hash on the host, which needs
++the previous step's sampled token ids there and async scheduling leaves them
++on the device.
+ """
+ 
++import os
+ import weakref
+ 
+ import numpy as np
+@@ -41,6 +52,7 @@ import torch
+ from torch import nn
+ 
+ from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.config.engram import EngramConfig
+ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+@@ -50,6 +62,10 @@ from vllm.logger import init_logger
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.utils import set_weight_attrs
++from vllm.models.deepseek_v4_1.common.engram_disk import (
++    DiskEngramTable,
++    build_row_file,
++)
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.platform_utils import is_uva_available
+ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+@@ -561,6 +577,21 @@ def _engram_head_shard_weight_loader(
+     param.data.copy_(shard)
+ 
+ 
++def _engram_disk_shard_weight_loader(
++    param: torch.nn.Parameter, loaded_weight: torch.Tensor
++) -> None:
++    """Stage this rank's head buckets for the on-disk row file.
++
++    Same narrowing as the resident loader, but the parameter holds no rows, so
++    the shard goes to the owning module instead. `narrow` is a view of the
++    checkpoint, not a copy, so staging costs nothing until the file is written.
++    """
++    if loaded_weight.dtype == torch.float8_e8m0fnu:
++        loaded_weight = loaded_weight.view(torch.uint8)
++    shard = loaded_weight.narrow(0, param.engram_vocab_start, param.engram_disk_rows)
++    param.engram_module()._stage_disk_shard(param.engram_disk_field, shard)
++
++
+ @triton.jit
+ def _engram_lookup_kernel(
+     weight,
+@@ -624,7 +655,14 @@ class ParallelEngramEmbedding(nn.Module):
+     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
+ 
+     With `cpu_offload` the shard lives in pinned host memory and is read over
+-    UVA instead of HBM; the TP sharding is unchanged either way.
++    UVA instead of HBM. With `table_path` it lives on disk and is read row by
++    row on the CPU, which is the only option that frees device memory on a
++    host whose CPU and accelerator share one pool. The TP sharding is
++    unchanged in all three cases.
++
++    A disk read blocks the thread that issues it, so `prefetch` can start it
++    before the forward that needs the rows. It is optional: a lookup with no
++    matching prefetch reads for itself.
+     """
+ 
+     def __init__(
+@@ -634,12 +672,19 @@ class ParallelEngramEmbedding(nn.Module):
+         head_sizes: tuple[int, ...],
+         block_size: int = 32,
+         cpu_offload: bool = False,
++        table_path: str | None = None,
++        disk_read_threads: int = 12,
++        disk_direct_io: bool = True,
++        prefix: str = "engram",
+     ):
+         super().__init__()
+         tp_size = get_tensor_model_parallel_world_size()
+         tp_rank = get_tensor_model_parallel_rank()
+         assert head_sizes and all(size > 0 for size in head_sizes)
+         assert sum(head_sizes) <= num_embeddings
++        # Disk storage supersedes pinned storage: it is asked for precisely
++        # when pinning frees nothing.
++        cpu_offload = cpu_offload and table_path is None
+         if cpu_offload and not is_uva_available():
+             raise RuntimeError("Engram CPU offload requires UVA support")
+         self.num_embeddings = num_embeddings
+@@ -654,37 +699,62 @@ class ParallelEngramEmbedding(nn.Module):
+         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
+         self.tp_size = tp_size
+         self.cpu_offload = cpu_offload
++        self.table_path = table_path
+         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
+         self._view_src: tuple[int, int] | None = None
++        self._table: DiskEngramTable | None = None
++        # (ids, handle) of an outstanding prefetch, at most one.
++        self._pending: tuple[torch.Tensor, object] | None = None
++        self._staged: dict[str, torch.Tensor] = {}
+         self._num_sms = torch.cuda.get_device_properties(
+             torch.accelerator.current_device_index()
+         ).multi_processor_count
+ 
++        if table_path is not None:
++            os.makedirs(table_path, exist_ok=True)
++            self._row_file = os.path.join(
++                table_path, f"{prefix.replace('/', '_')}.rank{tp_rank}.bin"
++            )
++            self._disk_read_threads = disk_read_threads
++            self._disk_direct_io = disk_direct_io
+         # Explicit device: model init runs under a `torch.device("cuda")`
+-        # context, which would otherwise put the shard in HBM.
++        # context, which would otherwise put the shard in HBM. The disk path
++        # keeps no rows at all, so its parameters exist only to carry the
++        # weight loader; the row count travels as an attribute instead.
++        rows = 0 if table_path is not None else self.part_num_embeddings
+         kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+         self.weight = nn.Parameter(
+-            torch.empty(
+-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
+-            ),
++            torch.empty(rows, dim, dtype=torch.float8_e4m3fn, **kwargs),
+             requires_grad=False,
+         )
+         self.weight_scale_inv = nn.Parameter(
+-            torch.empty(
+-                self.part_num_embeddings,
+-                dim // block_size,
+-                dtype=torch.uint8,
+-                **kwargs,
+-            ),
++            torch.empty(rows, dim // block_size, dtype=torch.uint8, **kwargs),
+             requires_grad=False,
+         )
+-        for param in (self.weight, self.weight_scale_inv):
+-            set_weight_attrs(
+-                param,
+-                {
+-                    "weight_loader": _engram_head_shard_weight_loader,
+-                    "engram_vocab_start": self.vocab_start_idx,
+-                },
++        for field, param in (
++            ("weight", self.weight),
++            ("scale", self.weight_scale_inv),
++        ):
++            attrs = {
++                "weight_loader": _engram_head_shard_weight_loader,
++                "engram_vocab_start": self.vocab_start_idx,
++            }
++            if table_path is not None:
++                attrs.update(
++                    weight_loader=_engram_disk_shard_weight_loader,
++                    engram_disk_rows=self.part_num_embeddings,
++                    engram_disk_field=field,
++                    # Weak, so the parameter does not keep the module alive.
++                    engram_module=weakref.ref(self),
++                )
++            set_weight_attrs(param, attrs)
++        if table_path is not None:
++            logger.info(
++                "Engram table stored on disk at %s: %d rows x %d, %.2f GiB per rank",
++                self._row_file,
++                self.part_num_embeddings,
++                dim,
++                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+             )
+         if cpu_offload:
+             logger.info(
+@@ -695,6 +765,139 @@ class ParallelEngramEmbedding(nn.Module):
+                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+             )
+ 
++    def _stage_disk_shard(self, field: str, shard: torch.Tensor) -> None:
++        """Collect one half of the shard, and write the row file once both are in.
++
++        Values and scales arrive as two separate loads but the file interleaves
++        them, so the first to arrive waits for its partner. Only the row file
++        survives; nothing here stays resident.
++        """
++        assert self.table_path is not None
++        self._staged[field] = shard
++        if len(self._staged) < 2:
++            return
++        build_row_file(
++            self._row_file,
++            self._staged["weight"],
++            self._staged["scale"],
++            self.block_size,
++        )
++        self._staged.clear()
++        self._table = DiskEngramTable(
++            self._row_file,
++            self.dim,
++            row_start=self.vocab_start_idx,
++            row_count=self.part_num_embeddings,
++            block_size=self.block_size,
++            threads=self._disk_read_threads,
++            use_odirect=self._disk_direct_io,
++        )
++
++    def _refuse_capture(self, what: str) -> None:
++        """Both halves of the disk path are CPU work, so neither can be graphed.
++
++        Capture would record the device copy at most, so every replay would
++        serve the rows of whichever ids were live at capture time.
++        """
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                f"The Engram table is on disk, and a disk {what} cannot be "
++                "captured in a CUDA graph because the read is issued by the "
++                "CPU. Stage the rows before capture: call prepare_embeddings "
++                "outside the captured region so it only reads staged_rows. "
++                "Engram.forward itself captures fine that way, and a replay "
++                "picks up rows refilled in the staging buffer afterwards."
++            )
++
++    def _local_cols(self, indices: torch.Tensor, copy: bool = False):
++        """This rank's hash columns on the CPU, or None when it has none.
++
++        A rank that owns no heads still has columns, to keep the all-gather
++        rectangular; there is just nothing on disk to read for them.
++        """
++        cols = indices[:, self.head_start : self.head_start + self.part_n_hash_cols]
++        if not cols.numel():
++            return None
++        return cols.to("cpu", copy=copy)
++
++    def prefetch(self, indices: torch.Tensor) -> None:
++        """Start the read for `indices`, so the lookup that follows can skip it.
++
++        Optional, and inert unless the table is on disk. `indices` is the same
++        [num_tokens, n_hash_cols] block `lookup` takes, so a caller does not
++        have to know this rank's head range, and it may be on the CPU, which is
++        the point: a caller holding the ids before the forward never waits for
++        the GPU to produce them.
++
++        One read outstanding per module. A second prefetch abandons the first,
++        whose rows are then read and dropped; the reader pool serializes, so
++        the abandoned read still delays the next one.
++        """
++        if self.table_path is None:
++            return
++        assert self._table is not None, "Engram table was never loaded"
++        self._refuse_capture("prefetch")
++        # copy=True: `.to("cpu")` on a tensor already on the CPU hands back the
++        # caller's own storage. The ids are the key this is matched on, so a
++        # caller that refills its buffer would make the key match its new
++        # contents and be served the rows read for the old ones.
++        cols = self._local_cols(indices, copy=True)
++        if cols is None:
++            return
++        self._pending = (cols, self._table.submit(cols))
++
++    def cancel_prefetch(self) -> None:
++        """Forget an outstanding prefetch, so the next lookup reads for itself.
++
++        The read is not interruptible; this only stops its rows reaching a
++        lookup that did not ask for them. For a step that will not now run.
++        """
++        self._pending = None
++
++    def _take_prefetched(self, cols: torch.Tensor) -> torch.Tensor | None:
++        """Rows from a prefetch issued for exactly `cols`, else None.
++
++        Pops the entry either way. Leaving a mismatched one in place would let
++        it be compared against a later step's ids, and every step it survives
++        is another chance for that comparison to succeed by accident.
++        """
++        pending, self._pending = self._pending, None
++        if pending is None:
++            return None
++        ids, handle = pending
++        # Wait even when the ids are wrong: the read is already running, the
++        # reader pool serializes, so the fallback would queue behind it anyway,
++        # and an abandoned handle swallows whatever error it raised.
++        rows = self._table.wait(handle)
++        # Matched on the ids themselves. A shape or a step counter is not
++        # enough: consecutive decode steps have identical shapes, and a step
++        # that is rolled back and rerun repeats its counter.
++        if ids.shape != cols.shape or not torch.equal(ids, cols):
++            return None
++        return rows
++
++    def _disk_lookup(self, indices: torch.Tensor, out: torch.Tensor) -> None:
++        """Read this rank's heads from the row file into `out`.
++
++        Takes the rows from a matching `prefetch` when there is one. Otherwise
++        the read runs here, blocking the calling thread: it is issued by the
++        CPU, so unlike the fused kernel it cannot be queued behind other device
++        work and `background` has nothing to trade away.
++        """
++        assert self._table is not None, "Engram table was never loaded"
++        self._refuse_capture("lookup")
++        cols = self._local_cols(indices)
++        if cols is None:
++            out.zero_()
++            return
++        rows = self._take_prefetched(cols)
++        if rows is None:
++            rows = self._table.gather(cols)
++        pad = self.part_n_hash_cols - rows.shape[1]
++        if pad:
++            rows = torch.nn.functional.pad(rows, (0, 0, 0, pad))
++        out.copy_(rows)
++
+     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+         """Parameters when resident, else cached UVA views of the pinned shard.
+ 
+@@ -723,6 +926,9 @@ class ParallelEngramEmbedding(nn.Module):
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
++        if self.table_path is not None:
++            self._disk_lookup(indices, out)
++            return
+         weight, scales = self._storage()
+         # The table dwarfs TLB reach, so a persistent grid near the SM count
+         # beats one program per row; halve it to leave SMs for the main stream.
+@@ -906,12 +1112,16 @@ class Engram(nn.Module):
+         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
+         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
+         # suffix rule.
+-        engram_config = get_current_vllm_config().engram_config
++        engram_config = get_current_vllm_config().engram_config or EngramConfig()
+         self.embed_tokens = ParallelEngramEmbedding(
+             layout.num_embeddings[layer_hash_index],
+             layout.head_dim,
+             tuple(size for order in layout.primes[layer_hash_index] for size in order),
+-            cpu_offload=engram_config.cpu_offload if engram_config else True,
++            cpu_offload=engram_config.cpu_offload,
++            table_path=engram_config.table_path,
++            disk_read_threads=engram_config.disk_read_threads,
++            disk_direct_io=engram_config.disk_direct_io,
++            prefix=f"{prefix}.embed_tokens",
+         )
+         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+         self.wkv = ReplicatedLinear(
+@@ -940,8 +1150,22 @@ class Engram(nn.Module):
+             dtype=torch.bfloat16,
+         )
+ 
++    def prefetch(self, hash_ids: torch.Tensor) -> None:
++        """Start this layer's row read before the forward that consumes it.
++
++        Optional, and inert unless the table is on disk. `prepare_embeddings`
++        uses the rows only when they were issued for exactly these ids and
++        reads them itself otherwise, so a caller may prefetch some steps and
++        not others. No caller exists yet; see the module docstring for what one
++        would have to do to hold the ids this early.
++        """
++        self.embed_tokens.prefetch(hash_ids)
++
+     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+-        """Gather this layer's rows on the main stream before decoder layers."""
++        """Gather this layer's rows on the main stream before decoder layers.
++
++        Consumes a matching `prefetch` when one is outstanding.
++        """
+         self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
+ 
+     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+diff --git a/vllm/models/deepseek_v4_1/common/engram_disk.py b/vllm/models/deepseek_v4_1/common/engram_disk.py
+new file mode 100644
+index 0000000..b30e298
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/common/engram_disk.py
+@@ -0,0 +1,332 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Disk-backed storage for the Engram n-gram table.
++
++`ParallelEngramEmbedding` keeps its shard in HBM, or with `cpu_offload` in
++pinned host memory read over UVA. Both charge the shard against a memory pool
++the KV cache also draws from: on hosts where the CPU and the accelerator share
++one physical pool (GB10, and any unified-memory part), pinning frees no device
++memory at all. This module puts the shard on local disk instead and reads the
++rows it needs on each lookup.
++
++Two pieces:
++
++`build_row_file`
++    Writes the checkpoint's two disjoint regions (fp8 values, ue8m0 block
++    scales) as one interleaved fixed-stride row file, so a row is one
++    contiguous read instead of two.
++
++`DiskEngramTable`
++    Reads rows and dequantizes to bf16, bit-for-bit as
++    `_engram_lookup_kernel` does. `submit`/`wait` expose the read
++    asynchronously so a caller can stage rows before a captured region runs.
++
++Reads are dispatched once per gather to a persistent worker set, each worker
++claiming a contiguous slice of the row list. One task per row was measurably
++slower; so were sort-and-merge and a `torch.gather` extraction. The device
++block size is probed at open rather than assumed, which matters: a 512-byte
++logical block turns a row read into 1024 bytes instead of 8192.
++
++Read amplification is structural and accepted. The heads of one n-gram come
++from `rolling % prime[h] + offset[h]` over different primes, so no static
++layout co-locates them, and a 264-byte row (dim 256) is smaller than a block.
++The traffic that matters is per decode step, which is one lookup per head per
++token.
++"""
++
++from __future__ import annotations
++
++import itertools
++import mmap
++import os
++import threading
++from concurrent.futures import Future, ThreadPoolExecutor
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++FP8_BLOCK_SIZE = 32
++SECTOR = 512
++PAGE = 4096
++_O_DIRECT = getattr(os, "O_DIRECT", 0)
++
++
++def row_stride(dim: int, block_size: int = FP8_BLOCK_SIZE) -> int:
++    """Bytes per interleaved row: `dim` fp8 values then `dim // block` scales."""
++    assert dim % block_size == 0, (dim, block_size)
++    return dim + dim // block_size
++
++
++def build_row_file(
++    path: str,
++    weight: torch.Tensor,
++    scale: torch.Tensor,
++    block_size: int = FP8_BLOCK_SIZE,
++    chunk_rows: int = 1 << 16,
++) -> int:
++    """Write `weight`/`scale` to `path` as interleaved fixed-stride rows.
++
++    `weight` is [n, dim] float8_e4m3fn, `scale` is [n, dim // block_size]
++    float8_e8m0fnu. Returns the row stride in bytes.
++    """
++    n, dim = weight.shape
++    assert scale.shape == (n, dim // block_size), (scale.shape, n, dim)
++    stride = row_stride(dim, block_size)
++    w = weight.cpu().view(torch.uint8)
++    s = scale.cpu().view(torch.uint8)
++    with open(path, "wb") as f:
++        for lo in range(0, n, chunk_rows):
++            hi = min(lo + chunk_rows, n)
++            f.write(torch.cat([w[lo:hi], s[lo:hi]], dim=1).contiguous().numpy().tobytes())
++    return stride
++
++
++class DiskEngramTable:
++    """One rank's shard of the Engram table, resident on NVMe.
++
++    Rows are addressed globally; `row_start` and `row_count` bound what this
++    rank owns. Indices outside that range gather zeros, matching the masked
++    behaviour of the sharded GPU path.
++
++    `gather` is `wait(submit(...))`. Both are safe to call from several threads;
++    the reads of one gather use the whole worker set, so gathers queue.
++    """
++
++    def __init__(
++        self,
++        path: str,
++        dim: int,
++        row_start: int = 0,
++        row_count: int | None = None,
++        block_size: int = FP8_BLOCK_SIZE,
++        threads: int = 64,
++        use_odirect: bool = True,
++    ) -> None:
++        self.dim = dim
++        self.block_size = block_size
++        self.stride = row_stride(dim, block_size)
++        self.row_start = row_start
++        self.n_scales = dim // block_size
++        self.num_scales = self.n_scales  # name used by the vLLM-side caller
++
++        self._fd = -1
++        self._direct = False
++        if use_odirect and _O_DIRECT:
++            try:
++                self._fd = os.open(path, os.O_RDONLY | _O_DIRECT)
++                self._direct = True
++            except OSError:
++                # Some filesystems refuse O_DIRECT at open. Clearing the flag
++                # matters: the aligned path is correct on a buffered fd, so a
++                # stale flag would pay for alignment forever and never say so.
++                pass
++        if not self._direct:
++            self._fd = os.open(path, os.O_RDONLY)
++        size = os.fstat(self._fd).st_size
++        total_rows = size // self.stride
++        self.row_count = total_rows if row_count is None else min(row_count, total_rows)
++
++        # O_DIRECT wants offset, length and buffer address aligned to the
++        # device's logical block size. 512 on the Spark NVMe, but 4096 on
++        # plenty of hardware, and a wrong guess is EINVAL on every read, so
++        # probe once instead of assuming.
++        self._align = self._probe_align(path) if self._direct else 1
++        # A row can start anywhere in a block, so cover it with one extra block.
++        # This is the byte count of every row read, so keep it tight.
++        blocks = (self.stride + self._align - 1) // self._align
++        self._span = (blocks + 1) * self._align
++
++        self._pool = _ReadPool(threads)
++        self._jobs = ThreadPoolExecutor(2, thread_name_prefix="engram-gather")
++
++    def _probe_align(self, path: str) -> int:
++        buf = memoryview(mmap.mmap(-1, PAGE))
++        for align in (SECTOR, PAGE):
++            try:
++                os.preadv(self._fd, [buf[:align]], 0)
++                return align
++            except OSError:
++                continue
++        # Nothing aligned works, so O_DIRECT is not usable on this file after
++        # all. Reopen buffered rather than fail every read with EINVAL.
++        os.close(self._fd)
++        self._fd = os.open(path, os.O_RDONLY)
++        self._direct = False
++        return 1
++
++    def close(self) -> None:
++        self._jobs.shutdown(wait=False)
++        self._pool.close()
++        if self._fd >= 0:
++            os.close(self._fd)
++            self._fd = -1
++
++    def __enter__(self) -> "DiskEngramTable":
++        return self
++
++    def __exit__(self, *exc) -> None:
++        self.close()
++
++    def submit(self, indices: torch.Tensor) -> Future:
++        """Start the gather. Returns a handle; the reads run in the background."""
++        return self._jobs.submit(self._gather, indices)
++
++    def wait(self, handle: Future) -> torch.Tensor:
++        """Block until `handle`'s gather is done and return its tensor."""
++        return handle.result()
++
++    def gather(self, indices: torch.Tensor) -> torch.Tensor:
++        """Dequantize the rows named by `indices` [..., k] to bf16 [..., k, dim].
++
++        Out-of-shard indices return zeros.
++        """
++        return self.wait(self.submit(indices))
++
++    def _gather(self, indices: torch.Tensor) -> torch.Tensor:
++        flat = indices.reshape(-1).to(torch.int64)
++        n = flat.numel()
++        if n == 0:
++            return torch.zeros(*indices.shape, self.dim, dtype=torch.bfloat16)
++        local = flat - self.row_start
++        owned = (local >= 0) & (local < self.row_count)
++        stride = self.stride
++
++        off = local * stride
++        if self._direct:
++            lo = off & (self._align - 1)
++            base = off - lo
++            # -1 marks a row this rank does not own; the workers skip it and it
++            # stays zero, which masked_fill would overwrite anyway.
++            base = torch.where(owned, base, torch.full_like(base, -1))
++            starts, offsets = base.tolist(), lo.tolist()
++        else:
++            starts = torch.where(owned, off, torch.full_like(off, -1)).tolist()
++            offsets = None
++
++        dst = bytearray(n * stride)
++        self._pool.run(self._fd, starts, offsets, dst, stride, self._span)
++
++        buf = torch.frombuffer(dst, dtype=torch.uint8).view(n, stride)
++        values = buf[:, :self.dim].view(torch.float8_e4m3fn).float()
++        # ue8m0 is a power of two, so its byte IS the fp32 exponent field.
++        # Decoded the way the kernel does it, including byte 0, which this
++        # gives 0.0 and torch's float8_e8m0fnu cast gives 2**-127.
++        exps = (buf[:, self.dim:].to(torch.int32) << 23).view(torch.float32)
++        out = values.unflatten(-1, (self.n_scales, self.block_size))
++        out = (out * exps.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
++        return out.masked_fill(~owned.unsqueeze(-1), 0).view(*indices.shape, self.dim)
++
++
++class _ReadPool:
++    """Worker threads woken once per gather, each claiming a slice of the rows.
++
++    One gather at a time: a gather already spreads over every worker, so
++    overlapping two of them would only add contention. Concurrent callers
++    queue on `_busy`.
++
++    A worker claims its slice when it wakes; it does NOT own a fixed slice.
++    Releasing k permits wakes k arbitrary workers out of the pool, so slices
++    keyed by thread identity leave rows unread whenever k is less than the
++    pool size. That failed silently, with zeros in the result and no error.
++    """
++
++    def __init__(self, threads: int) -> None:
++        self._n = max(threads - 1, 0)  # the calling thread takes a slice too
++        self._busy = threading.Lock()
++        self._local = threading.local()
++        self._job = None
++        self._step = 1
++        self._claim = itertools.count(1).__next__
++        self._left = 0
++        self._error: BaseException | None = None
++        self._tally = threading.Lock()
++        self._go = threading.Semaphore(0)
++        self._done = threading.Event()
++        self._stop = False
++        self._workers = [
++            threading.Thread(target=self._loop, daemon=True, name=f"engram-read-{i}")
++            for i in range(self._n)
++        ]
++        for w in self._workers:
++            w.start()
++
++    def close(self) -> None:
++        self._stop = True
++        for _ in self._workers:
++            self._go.release()
++        for w in self._workers:
++            w.join(timeout=1.0)
++
++    def run(self, fd, starts, offsets, dst, stride, span) -> None:
++        n = len(starts)
++        with self._busy:
++            self._job = (fd, starts, offsets, dst, stride, span, n)
++            parts = min(self._n + 1, n)
++            self._step = (n + parts - 1) // parts
++            # itertools.count.__next__ is one C call, so it is atomic under the
++            # GIL and costs far less than a lock. It is claimed once per worker,
++            # not once per row.
++            self._claim = itertools.count(1).__next__
++            helpers = parts - 1
++            self._left = helpers
++            self._error = None
++            if helpers:
++                self._done.clear()
++                for _ in range(helpers):
++                    self._go.release()
++            self._slice(0)
++            if helpers:
++                self._done.wait()
++            # A worker that died left its rows unread. Without this the gather
++            # returns zeros there and says nothing, which is the failure mode
++            # this whole file keeps tripping over.
++            if self._error is not None:
++                raise self._error
++
++    def _loop(self) -> None:
++        while True:
++            self._go.acquire()
++            if self._stop:
++                return
++            try:
++                self._slice(self._claim())
++            except BaseException as err:  # noqa: BLE001  re-raised in run()
++                self._error = err
++            finally:
++                with self._tally:
++                    self._left -= 1
++                    if self._left == 0:
++                        self._done.set()
++
++    def _slice(self, part: int) -> None:
++        fd, starts, offsets, dst, stride, span, n = self._job
++        lo = part * self._step
++        if lo >= n:
++            return
++        hi = min(lo + self._step, n)
++        preadv = os.preadv
++        if offsets is None:
++            # Buffered: read the row straight into its place in the result.
++            view = memoryview(dst)
++            for k in range(lo, hi):
++                start = starts[k]
++                if start >= 0:
++                    preadv(fd, [view[k * stride:(k + 1) * stride]], start)
++            return
++        # O_DIRECT: read the aligned block(s) covering the row, then copy the
++        # row out. The scratch buffer is per WORKER THREAD, never per task: a
++        # pool of N threads runs tasks k and k+N at the same time, so a
++        # per-task buffer races and silently returns another row's bytes.
++        buf = getattr(self._local, "buf", None)
++        if buf is None or len(buf) < span:
++            buf = self._local.buf = memoryview(mmap.mmap(-1, span))
++        for k in range(lo, hi):
++            start = starts[k]
++            if start < 0:
++                continue
++            preadv(fd, [buf], start)
++            o = offsets[k]
++            dst[k * stride:(k + 1) * stride] = buf[o:o + stride]

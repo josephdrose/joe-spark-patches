@@ -1,0 +1,22 @@
+# md5sums.txt
+#
+# md5 of every file shipped in this directory tree.
+# Verify with:  md5sum -c patch/md5sums.txt   (run from dsv41/)
+#
+# The .so is not shipped. It is built by build/vl41-build-image.sh.
+
+91167e71b3121d42571c8582d0608474  patch/engram-disk-table.patch
+1c92d18a4b449f595a8bc4d9dc4f6d02  patch/engram_disk.py
+0402c4d3959e4348dfb56f93fdd4ff3a  patch/vlpage-page64.py
+ddb0cec03bda4fd9abfd6ea2e8fe4162  patch/vl41-ops-bindings.cpp
+d1a313dd092381b92267a25442f4a750  patch/vl41-ops-build.py
+6ad42a07e5cdfccd2277456e7c357116  build/vl41-build-image.sh
+d0daa53c809fc88d56c4b554f7468d31  build/vlpage-build-image.sh
+f6f63fecf648b0fd2ff97bdd458fbb39  launch/vlpage-tp4-4node-up.sh
+f4a03f610e414073e3bd12f121e61adf  tests/build_real_engram_table.py
+25527a0dd1566b72434049aa91338a06  tests/check_engram_disk.sh
+33c57593715fa40b53902bda6bcf555d  tests/config_checks.py
+808f18a8f5b39171a69ceae564d77a18  tests/conftest.py
+d9d52231c43fe5b6446dfd1481888b0a  tests/engram_disk_harness.py
+83810d941e5b87f635301594de7f381c  tests/negative_control.py
+554d03181542c4d5122c578a7210dc0b  tests/test_engram_disk.py

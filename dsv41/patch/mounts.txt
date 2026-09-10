@@ -1,0 +1,72 @@
+# mounts.txt
+#
+# Where each file in patch/ lands.
+#
+# This recipe BAKES the files into an image with COPY. It does not bind-mount
+# them at run time. The paths below are the paths inside the container.
+#
+# Container package root:
+#   VLLM = /usr/local/lib/python3.12/dist-packages/vllm
+#
+# Base image: eugr/spark-vllm-b12x:latest
+# vLLM wheel: vllm-0.28.1rc1.dev391+g29af8bd67, the parent of PR #56214
+# PR commit:  e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba
+
+
+# ---------------------------------------------------------------------------
+# 1. engram-disk-table.patch
+#    git apply, against the vLLM tree at commit e47aa780. 4 files, +980 / -22.
+#    Applied by build/vl41-build-image.sh, step 4.
+# ---------------------------------------------------------------------------
+engram-disk-table.patch  ->  $VLLM/config/engram.py                          (modified)
+engram-disk-table.patch  ->  $VLLM/models/deepseek_v4_1/common/engram.py      (modified)
+engram-disk-table.patch  ->  $VLLM/models/deepseek_v4_1/common/engram_disk.py (new file)
+engram-disk-table.patch  ->  tests/kernels/test_engram.py                     (modified; test file)
+
+
+# ---------------------------------------------------------------------------
+# 2. engram_disk.py
+#    A standalone twin of the in-tree module. It imports no vLLM, so it runs in
+#    any image with torch. tests/test_engram_disk.py imports THIS file.
+#    NOT installed into site-packages. The in-tree version comes from the patch
+#    above, and the two files differ.
+# ---------------------------------------------------------------------------
+engram_disk.py  ->  (not installed; used by tests/test_engram_disk.py)
+
+
+# ---------------------------------------------------------------------------
+# 3. vlpage-page64.py
+#    An in-place editor. It drops no file. Run it against an installed tree:
+#      python3 vlpage-page64.py /usr/local/lib/python3.12/dist-packages/vllm
+#    Applied by build/vlpage-build-image.sh. Every substitution asserts its
+#    occurrence count, so a version drift fails loudly.
+# ---------------------------------------------------------------------------
+vlpage-page64.py  edits  $VLLM/models/deepseek_v4_1/attention.py              (3 edits)
+vlpage-page64.py  edits  $VLLM/models/deepseek_v4_1/nvidia/flashinfer_sparse.py (1 edit)
+vlpage-page64.py  edits  $VLLM/v1/attention/backends/mla/indexer.py           (1 edit)
+
+
+# ---------------------------------------------------------------------------
+# 4. The op shim.
+#    vl41-ops-build.py compiles vl41-ops-bindings.cpp together with the PR's own
+#    csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu,
+#    unchanged, for sm_121. Output is a 1.1 MB .so.
+#    build/vl41-build-image.sh also rewrites attention.py to load it.
+# ---------------------------------------------------------------------------
+vl41-ops-bindings.cpp  ->  compiled into  /opt/vl41/vl41_ops.so
+vl41-ops-build.py      ->  (build-time only; not installed)
+vl41_ops.so            ->  /opt/vl41/vl41_ops.so
+                           override the path with VL41_SHIM_SO
+build/vl41-build-image.sh  edits  $VLLM/models/deepseek_v4_1/attention.py
+                           adds the torch.ops.load_library block and redirects
+                           three torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_*
+                           call sites to _FUSED_KV_OPS
+
+
+# ---------------------------------------------------------------------------
+# 5. Host mounts made by launch/vlpage-tp4-4node-up.sh
+# ---------------------------------------------------------------------------
+$TABLE_HOST                     ->  /table            this rank's two Engram row files
+$HOME/.cache/huggingface        ->  /cache/huggingface
+$HOME/cc-scratch/vllm-v41/cache ->  /cache
+$HOME/cc-scratch/vllm-v41/tlcache -> /root/.tilelang   TileLang JIT cache

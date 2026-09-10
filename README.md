@@ -1,16 +1,40 @@
 # joe-spark-patches
 
-Out-of-tree code and patches for running **DeepSeek-V4-Flash-DSpark** on a
-4-node **DGX Spark (GB10 / sm_121)** cluster with vLLM. Collected while getting
+Out-of-tree code and patches for running **DeepSeek** models on a 4-node
+**DGX Spark (GB10 / sm_121)** cluster with vLLM.
+
+`dsv41/` is a full recipe for **DeepSeek-V4.1-Flash** at TP=4. Status: serving.
+
+Everything else came out of **DeepSeek-V4-Flash-DSpark**. Collected while getting
 DSpark speculative decoding to actually engage — posted in case they save
 someone else the time.
 
-Context: aidendle B12X image, sm_121 / CUDA 12.1, TP across all 4 nodes,
+V4-Flash context: aidendle B12X image, sm_121 / CUDA 12.1, TP across all 4 nodes,
 prefix-caching on, ~76-90 tok/s on code. **B12X stays on** — DSpark and B12X are
 not mutually exclusive; you do not need to disable B12X to get DSpark working.
 
 > Throughput numbers are from our own runs, not a controlled benchmark. The
 > proposer is first-pass code, shared as-is — read it before you run it.
+
+## dsv41/
+
+DeepSeek-V4.1-Flash at TP=4 on four Sparks. Serving.
+
+475.25 GiB of weights against 121.7 GiB per box. At TP=4 that is 118.81 GiB per
+rank. vLLM's Engram `cpu_offload` frees zero bytes on GB10, because the CPU and
+the GPU share one memory pool. This recipe keeps the 189.13 GiB Engram table on
+NVMe and gathers rows on the CPU.
+
+Measured on one serve: 314 s load, 620,493 KV tokens, 14.94 tok/s eager, 61.90
+tok/s with DSpark k=5. That was 16,384 context under `--enforce-eager`.
+
+Four fixes, each documented with its failure verbatim: the memory fit, the image
+build, the `apply_q_norm` op schema, and the KV page size. `dsv41/patch/` carries
+the exact files with md5s and a `mounts.txt`. `dsv41/docs/RECIPE.md` runs from a
+bare fleet to a serving endpoint.
+
+Unproven and listed as such in `dsv41/README.md`: quality, CUDA graphs,
+concurrency, context past 16,384, and the vision path.
 
 ## dspark/ — custom speculative-decode proposer
 
@@ -79,4 +103,7 @@ four-layer root cause.
 
 ## License
 
-Apache-2.0. The parsers derive from the vLLM project (Apache-2.0).
+Apache-2.0. The parsers derive from the vLLM project (Apache-2.0). The `dsv41/`
+patches derive from vLLM PR #56214 (Apache-2.0), with dequantization arithmetic
+ported from sgl-project/sglang (Apache-2.0). Credits for `dsv41/` are in
+`dsv41/README.md`.
