@@ -137,14 +137,48 @@ State of the work on 2026-09-10. Nothing below was measured.
 
 - **Quality.** No benchmark and no evaluation run. Four correct prompts do not
   measure quality.
-- **Engram numerics inside the model.** The lookup was checked bitwise against
-  the checkpoint outside vLLM. Nothing compared it to a reference inside a
-  served forward pass. In progress.
+- **Engram hash ids.** The reader was verified against the checkpoint. See
+  below. Nothing checked that the model computes the right row ids:
+  `rolling % prime[h] + offset[h]`, the compressed token map, or
+  `EngramLayout.offsets`. A wrong id reads a correct row and raises nothing.
+- **Engram behaviour inside a served forward pass.** The reader was checked
+  outside vLLM, in a second process, against a quiet disk. Nothing read the live
+  module instance or ran the reader under the serve's own load.
 - **CUDA graphs.** Every run used `--enforce-eager`. In progress.
 - **Concurrency.** One stream only.
 - **Context past 16,384.** The KV pool holds 620,493 tokens. No long prompt was
   run.
 - **Vision.** The vision path was never exercised.
+
+## Engram reader, verified
+
+144 rows across 8 shards. 0 differ. The serve ran throughout and was not
+restarted.
+
+Two comparisons, both bitwise:
+
+1. The `.bin` row files against the checkpoint, read by `pread` at computed
+   offsets. 8 of 8 shards, 18 of 18 rows byte-identical.
+2. The reader's own `gather()` output against a reference dequantized from
+   checkpoint bytes. 8 of 8 shards equal, 0 bad values.
+
+14 of the 18 rows per shard were seams: the first and last row of each of the 6
+owned buckets, plus the shard's own first and last. Random interior rows do not
+catch an offset error.
+
+Four negative controls. Each had to fail, and did:
+
+| Control | Result |
+|---|---|
+| Local row ids instead of global | 18 of 18 differ on ranks 1, 2, 3 |
+| Reader built with `row_start=0` | 16 of 16 differ on ranks 1-3 |
+| Reader built with `row_start+1` | 16 of 16 differ on every rank |
+| Gather shifted by one row | 18 of 18 differ |
+
+The comparison is index-sensitive at one-row granularity.
+
+144 rows of 768,022,850 is seam coverage. It does not detect sparse random
+corruption.
 
 ## Layout
 
