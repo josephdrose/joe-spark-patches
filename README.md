@@ -25,9 +25,10 @@ rank. vLLM's Engram `cpu_offload` frees zero bytes on GB10, because the CPU and
 the GPU share one memory pool. This recipe keeps the 189.13 GiB Engram table on
 NVMe and gathers rows on the CPU.
 
-Measured on one serve: 391 s load, 476,844 KV tokens, 46.31 tok/s on one stream
-with CUDA graphs and DSpark k=5, 97.98 tok/s aggregate at four streams. That was
-16,384 context.
+Measured at 16,384 context: 391 s load, 476,844 KV tokens, 46.31 tok/s on one
+stream with CUDA graphs and DSpark k=5, 97.98 tok/s aggregate at four streams.
+At the full 1,048,576 window: a 1,180,171-token KV pool, and needle recall
+correct at 7 of 7 runs up to a 262,144-token prompt.
 
 Seven fixes, each documented with its failure verbatim: the memory fit, the
 image build, the `apply_q_norm` op schema, the KV page size, CUDA graph capture,
@@ -36,7 +37,8 @@ files with md5s and a `mounts.txt`. `dsv41/docs/RECIPE.md` runs from a bare
 fleet to a serving endpoint.
 
 Unproven and listed as such in `dsv41/README.md`: quality, concurrency above 4
-streams, context past 16,384, and the vision path.
+streams, context above 262,144, decode throughput at long context, and the
+vision path.
 
 ## dspark/ — custom speculative-decode proposer
 

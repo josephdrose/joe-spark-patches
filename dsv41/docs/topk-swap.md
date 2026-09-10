@@ -6,8 +6,8 @@ None on this fleet. `persistent_topk` never failed here. This change is
 insurance for long context. It fixed no failure seen in this work.
 
 The reported failure belongs to `tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark`,
-fix 7. Their crash needed a 1M-wide logits buffer. Every run in this repository
-was at 16,384 context.
+fix 7. Their crash needed a 1M-wide logits buffer. The measurements below were
+taken at 16,384, where the buffer is far from that width.
 
 ## The cause
 
@@ -66,5 +66,6 @@ context.
 
 ## Not covered
 
-The failure mode itself. Nothing here ran at a width where `persistent_topk` is
-reported to die, so this edit is unproven against the case it exists for.
+The failure mode itself. This edit was installed for every long-context run
+here, including the 262,144-token needle, so `persistent_topk` never ran at
+those widths. Whether it would have failed there is untested.

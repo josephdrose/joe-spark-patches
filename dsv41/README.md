@@ -51,7 +51,9 @@ Sizes below are measured from all 48 safetensors headers.
 
 ## Measured
 
-Every number below comes from one serve on this fleet.
+Every number below comes from this fleet. Two serves are reported. Both are
+`vlspeed-eng:4` at TP=4, gmu 0.78, `--max-num-seqs 4`, DSpark k=5, CUDA graphs
+on. They differ in `--max-model-len`.
 
 | Item | Value |
 |---|---|
@@ -59,28 +61,63 @@ Every number below comes from one serve on this fleet.
 | Fingerprint | `vllm-0.28.1rc1.dev391+g29af8bd67-tp4` |
 | Image | `vlspeed-eng:4` |
 | Weights resident | 81.36 GiB per rank, with the DSpark draft layers |
+
+### At 16,384 context
+
+| Item | Value |
+|---|---|
 | Load time | 391 s |
-| CUDA graphs | on. 0.30 GiB captured in 4 s |
 | KV cache | 476,844 tokens at 9.03 GiB |
-| Context | 16,384 |
-| Concurrency | 29.1x at 16,384 |
+| Max concurrency | 29.1x |
+| CUDA graphs | 0.30 GiB captured in 4 s |
 | Host memory free while serving | 7 to 9 GiB per box |
 
-Speed, DSpark k=5, `--max-num-seqs 4`, gmu 0.78. C1 is one stream, C4 is four.
-The aggregate is the mean over 8 categories with counting excluded. All figures
-are tok/s.
+Speed, DSpark k=5. C1 is one stream, C4 is four. The aggregate is the mean over
+8 categories with counting excluded. All figures are tok/s.
 
 | Config | C1 agg | C4 agg | Counting C1 |
 |---|--:|--:|--:|
 | Eager | 40.15 | 95.15 | 72.07 |
 | **CUDA graphs** | **46.31** | **97.98** | **85.19** |
 
-Run-to-run spread is about 2%. Confirmed by hand on the final serve: 70.52 tok/s
+Run-to-run spread is about 2%. Confirmed by hand on that serve: 70.52 tok/s
 single stream on a counting prompt, 206 tokens in 2.92 s, `finish_reason: stop`.
 The full table, including k=10 and 8K prefill, is in
 [docs/cuda-graphs.md](docs/cuda-graphs.md).
 
 A 3,853-token prompt was answered correctly.
+
+### At 1,048,576 context
+
+Read from the live serve. Bring it up with `CTX=1048576`.
+
+| Item | Value |
+|---|---|
+| Context | 1,048,576 |
+| KV cache | 1,180,171 tokens at 5.09 GiB |
+| Max concurrency | 1.13x |
+| CUDA graphs | 0.44 GiB |
+| Engine init | 56.07 s |
+
+Needle recall, 7 runs, 7 pass. The needle string was `COPPER-LANTERN-8315`.
+Depth is the fraction of the prompt the needle sits at. The rate column is
+prefill only.
+
+| Target | Depth | Prompt tokens | TTFT s | Prefill tok/s | Result |
+|--:|--:|--:|--:|--:|---|
+| 32,768 | 0.1 | 32,376 | 17.9 | 1806.5 | pass |
+| 32,768 | 0.5 | 32,351 | 17.5 | 1853.3 | pass |
+| 32,768 | 0.9 | 32,330 | 16.0 | 2021.2 | pass |
+| 131,072 | 0.1 | 130,422 | 77.1 | 1692.7 | pass |
+| 131,072 | 0.5 | 130,258 | 75.1 | 1735.1 | pass |
+| 131,072 | 0.9 | 130,219 | 68.7 | 1895.8 | pass |
+| 262,144 | 0.5 | 260,119 | 164.3 | 1583.4 | pass |
+
+Those 7 ran on an earlier boot at the same flags. That image carried one extra
+patch, a KV-accounting logger, which changes no serving path. Its pool came out
+at 1,150,699 tokens and 5.55 GiB.
+
+No decode throughput was measured at this context.
 
 Verified output:
 
@@ -120,8 +157,12 @@ python3 tests/build_real_engram_table.py --out $HOME/table --layer 1 --rank 0
 python3 tests/build_real_engram_table.py --out $HOME/table --layer 14 --rank 0
 
 # 4. Serve. Edit NODE_TS and NODE_LAN first.
-DSPARK=5 GPU_UTIL=0.78 ./launch/vlspeed-tp4-4node-up.sh
+DSPARK=5 ./launch/vlspeed-tp4-4node-up.sh                  # 16,384 context
+DSPARK=5 CTX=1048576 ./launch/vlspeed-tp4-4node-up.sh      # full window
 ```
+
+The speed table above was measured at the first command. The needle table and
+the 1M pool figures were measured at the second.
 
 The IP addresses in `launch/vlspeed-tp4-4node-up.sh` are RFC 5737 documentation
 ranges. Replace them with your own. Host paths use `$HOME`.
@@ -162,8 +203,12 @@ State of the work on 2026-09-10. Nothing below was measured.
   that the model computes the right row ids: `rolling % prime[h] + offset[h]`,
   the compressed token map, or `EngramLayout.offsets`. A wrong id reads a
   correct row and raises nothing.
-- **Context past 16,384.** Every run was at 16,384. Nothing exercised the KV
-  pool at 300K or 1M, the `persistent_topk` failure mode, or FlashInfer #5015.
+- **Context between 262,144 and 1,048,576.** The needle passed at 262,144. No
+  prompt above it was run, so the top of the declared window is unproven.
+- **Decode throughput at long context.** The speed table is 16,384 only. The
+  needle runs record prefill and TTFT.
+- **The `persistent_topk` failure mode.** `top_k_per_row_decode` was installed
+  for every long-context run here, so nothing exercised the kernel it replaces.
 - **Concurrency above 4.** The bench ran 1, 2 and 4 streams.
 - **That every decode batch hit an exact FULL graph.** The capture sizes were
   derived. No per-batch trace confirmed them.

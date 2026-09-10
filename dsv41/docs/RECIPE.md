@@ -6,6 +6,9 @@ OpenAI-compatible endpoint on the head node.
 Result on this fleet: 391 s load, 476,844 KV tokens, and 46.31 tok/s on one
 stream with CUDA graphs and DSpark k=5, at 16,384 context.
 
+At the full 1,048,576 window the same image gives a 1,180,171-token KV pool, and
+a needle at 262,144 comes back correct.
+
 ## 0. Prerequisites
 
 | Item | Requirement |
@@ -101,8 +104,13 @@ Both address arrays ship as RFC 5737 documentation ranges. Replace them.
 
 ```bash
 DRYRUN=1 ./launch/vlspeed-tp4-4node-up.sh                  # print the per-rank scripts
-DSPARK=5 GPU_UTIL=0.78 ./launch/vlspeed-tp4-4node-up.sh    # bring up
+DSPARK=5 ./launch/vlspeed-tp4-4node-up.sh                  # bring up at 16,384
+DSPARK=5 CTX=1048576 ./launch/vlspeed-tp4-4node-up.sh      # bring up at the full window
 ```
+
+`CTX` sets `--max-model-len`. The default is 16,384, which is where the speed
+table in the [README](../README.md) was measured. `CTX=1048576` is where the
+needle table was measured.
 
 The script starts ranks 3, 2 and 1 headless, then rank 0. It polls
 `/v1/models` on the head for up to 30 minutes. Load takes 391 s here.

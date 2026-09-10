@@ -45,7 +45,7 @@ NAME="${NAME:-vlspeed-tp4}"
 
 TP="${TP:-4}"
 CTX="${CTX:-16384}"
-GPU_UTIL="${GPU_UTIL:-0.80}"
+GPU_UTIL="${GPU_UTIL:-0.78}"
 MAXSEQS="${MAXSEQS:-4}"
 MAXBATCH="${MAXBATCH:-4096}"
 EAGER="${EAGER:-0}"                 # 1 = --enforce-eager, skips graph capture

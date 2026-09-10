@@ -73,7 +73,7 @@ clean in the tail of the log.
 
 - Quality. No benchmark and no evaluation run.
 - Concurrency at the endpoint above 4 streams. The bench ran 1, 2 and 4.
-- Context past 16,384.
+- Context above 262,144, which is the largest needle prompt run.
 - The vision path.
 - The rank row offset. That was checked by reading the code. No test covers it.
   See
