@@ -3,11 +3,10 @@
 Target: `deepseek-ai/DeepSeek-V4.1-Flash` at TP=4 on four DGX Sparks, with an
 OpenAI-compatible endpoint on the head node.
 
-Result on this fleet at the default 1,048,576 window: a 1,180,171-token KV
-pool, and a needle at 262,144 that comes back correct.
-
-At `CTX=16384` the same image gives 391 s load, 476,844 KV tokens, and 46.31
-tok/s on one stream with CUDA graphs and DSpark k=5.
+Result on this fleet at the default 1,048,576 window: a 2,900,475-token KV
+pool, 96.41 tok/s on one counting stream, and a needle at 262,144 that comes
+back correct. The defaults are the b12x bf16 MoE backend, `--max-num-seqs 8` and
+DSpark k=5. The numbers are in the [README](../README.md).
 
 ## 0. Prerequisites
 
@@ -109,11 +108,20 @@ DSPARK=5 CTX=16384 ./launch/vlspeed-tp4-4node-up.sh        # bring up at 16,384
 ```
 
 `CTX` sets `--max-model-len`. The default is 1,048,576, which matches the live
-serve and is where the needle table in the [README](../README.md) was measured.
-`CTX=16384` is where the speed table was measured.
+serve and is where every README table was measured. `CTX=16384` is where the
+eager against CUDA-graphs comparison in [cuda-graphs.md](cuda-graphs.md) was
+measured.
+
+Two defaults are load-bearing at 1M. The launcher clears the docker `--memory`
+cap above `CTX` 262144, because the cap starves the KV pool. It also runs
+`drop_caches` and `compact_memory` on all four boxes before the start, because
+b12x weight prep needs contiguous host pages. `DEFRAG=0` skips the second one.
+
+`MOE_BACKEND=b12x` with `B12X_A16=1` gives the bf16 activation variant. Drop
+`B12X_A16` to get W4A8. `MOE_BACKEND=` empty gives DeepGEMM.
 
 The script starts ranks 3, 2 and 1 headless, then rank 0. It polls
-`/v1/models` on the head for up to 30 minutes. Load took 391 s at `CTX=16384`
+`/v1/models` on the head for up to 30 minutes. The 1M b12x boot took about 510 s
 here.
 
 `DSPARK` must be a multiple of 5. See [spec-decode.md](spec-decode.md).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vl41-build-image.sh — build vl41-eng:2 on all four Sparks.
+# vl41-build-image.sh: build vl41-eng:2 on all four Sparks.
 #
 # There is no from-source vLLM build here and none is needed. The pieces:
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vlpage-build-image.sh — build vlpage-eng:3 on all four Sparks.
+# vlpage-build-image.sh: build vlpage-eng:3 on all four Sparks.
 #
 # vlpage-eng:3 = vl41-eng:2 (see vl41-build-image.sh) + vlpage-page64.py, which
 # puts every DeepSeek-V4.1 KV page on 64 states so the FlashInfer sm120

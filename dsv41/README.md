@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash on four DGX Sparks (vLLM, TP=4, Engram on NVMe)
 
 **Status: serving.** The endpoint answers prompts and returns parsed tool calls.
-Run date 2026-09-10.
+Run date 2026-09-11.
 
 `deepseek-ai/DeepSeek-V4.1-Flash` is 475.25 GiB of weights. Four DGX Sparks hold
 121.7 GiB each. At TP=4 that is 118.81 GiB per rank against 121.7 GiB physical.
@@ -51,59 +51,112 @@ Sizes below are measured from all 48 safetensors headers.
 
 ## Measured
 
-Every number below comes from this fleet. Two serves are reported. Both are
-`vlspeed-eng:4` at TP=4, gmu 0.78, `--max-num-seqs 4`, DSpark k=5, CUDA graphs
-on. They differ in `--max-model-len`.
+Every number below comes from this fleet on 2026-09-11, at the full 1,048,576
+window. The serve is `vlspeed-eng:4` at TP=4 with the b12x bf16 MoE backend.
+The launcher defaults reproduce it.
+
+### The serve
 
 | Item | Value |
 |---|---|
 | Endpoint | `spark-2:8410`, served model `deepseek-v41-flash` |
 | Fingerprint | `vllm-0.28.1rc1.dev391+g29af8bd67-tp4` |
 | Image | `vlspeed-eng:4` |
-| Weights resident | 81.36 GiB per rank, with the DSpark draft layers |
-
-### At 16,384 context
-
-Bring this one up with `CTX=16384`.
-
-| Item | Value |
-|---|---|
-| Load time | 391 s |
-| KV cache | 476,844 tokens at 9.03 GiB |
-| Max concurrency | 29.1x |
-| CUDA graphs | 0.30 GiB captured in 4 s |
-| Host memory free while serving | 7 to 9 GiB per box |
-
-Speed, DSpark k=5. C1 is one stream, C4 is four. The aggregate is the mean over
-8 categories with counting excluded. All figures are tok/s.
-
-| Config | C1 agg | C4 agg | Counting C1 |
-|---|--:|--:|--:|
-| Eager | 40.15 | 95.15 | 72.07 |
-| **CUDA graphs** | **46.31** | **97.98** | **85.19** |
-
-Run-to-run spread is about 2%. Confirmed by hand on that serve: 70.52 tok/s
-single stream on a counting prompt, 206 tokens in 2.92 s, `finish_reason: stop`.
-The full table, including k=10 and 8K prefill, is in
-[docs/cuda-graphs.md](docs/cuda-graphs.md).
-
-A 3,853-token prompt was answered correctly.
-
-### At 1,048,576 context
-
-This is the launcher default. Read from the live serve.
-
-| Item | Value |
-|---|---|
 | Context | 1,048,576 |
-| KV cache | 1,180,171 tokens at 5.09 GiB |
-| Max concurrency | 1.13x |
-| CUDA graphs | 0.44 GiB |
-| Engine init | 56.07 s |
+| Memory and batching | `--gpu-memory-utilization 0.78 --max-num-seqs 8 --max-num-batched-tokens 8192` |
+| MoE backend | `--moe-backend b12x` plus `VLLM_B12X_MOE_FP4_FORCE_A16=1` |
+| Backend line in the head log | `Using 'B12X_MXFP4_BF16' Mxfp4 MoE backend.` |
+| Speculative decode | DSpark k=5 |
+| CUDA graphs | FULL_AND_PIECEWISE |
+| Tokenizer | `--tokenizer-mode deepseek_v41` |
+| Tool calls | `--enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41` |
+| Engram table | 189.13 GiB, on NVMe |
+| Docker memory cap | None. Read finding 3. |
 
-Needle recall, 7 runs, 7 pass. The needle string was `COPPER-LANTERN-8315`.
-Depth is the fraction of the prompt the needle sits at. The rate column is
-prefill only.
+Boot and pool, head rank:
+
+| Item | Value |
+|---|--:|
+| Weight load | 289.73 s |
+| Model loading | 368.06 s |
+| Available KV cache memory | 12.84 GiB |
+| KV cache | 2,900,475 tokens |
+| Max concurrency at 1,048,576 | 2.77x |
+| Engine init | 99.61 s |
+
+### Single stream
+
+Temperature 0.4, `reasoning_effort` 75, 3 repetitions, median decode tok/s.
+TTFT is excluded from the rate.
+
+| Workload | tok/s |
+|---|--:|
+| counting | 96.41 |
+| code | 74.54 |
+| code, thinking on | 67.79 |
+| prose | 38.59 |
+
+### Concurrency
+
+Mixed set of 8 categories. Counting is excluded from the aggregate. The two
+boots ran the same prompt set and differ in `--max-num-seqs`.
+
+| Streams | agg tok/s, seqs=4 | agg tok/s, seqs=8 | TTFT s, seqs=4 | TTFT s, seqs=8 |
+|--:|--:|--:|--:|--:|
+| 1 | 51.33 | 51.58 | 0.303 | 0.313 |
+| 2 | 81.03 | 81.26 | 0.376 | 0.379 |
+| 4 | 113.85 | 116.06 | 0.522 | 0.496 |
+| 6 | 100.35 | 141.74 | 2.249 | 0.573 |
+| 8 | 110.34 | 159.56 | 3.212 | 0.660 |
+
+At `seqs=4` the 6-stream and 8-stream points fall below the 4-stream point. The
+extra streams queue, and TTFT rises to 3.2 s. At `seqs=8` the aggregate keeps
+rising to 159.56 tok/s.
+
+The counting prompt is the ceiling. At `seqs=8` its aggregate is 271.84 tok/s on
+6 streams and 311.52 tok/s on 8 streams.
+
+The `seqs=4` boot allocated 3,709,285 KV tokens. The `seqs=8` boot allocated
+2,900,475.
+
+### MoE backends
+
+Single stream at 1,048,576, temperature 0.4, `reasoning_effort` 75, median of 3.
+
+| Workload | DeepGEMM | b12x W4A8 | b12x bf16 |
+|---|--:|--:|--:|
+| counting | 88.07 | 97.45 | 95.49 |
+| code | 62.86 | 69.24 | 68.40 |
+| code, thinking on | 59.08 | 65.91 | 64.83 |
+| prose | 39.27 | 44.24 | 46.46 |
+| KV tokens | 1,372,132 | 1,175,588 | 3,709,285 |
+
+The KV row is `--max-num-seqs 4` on all three columns. At `--max-num-seqs 8` the
+bf16 backend gives 2,900,475 tokens.
+
+### Quality
+
+tool-eval-bench 2.6.1, 88 scenarios, 3 trials each, seed 42, temperature 0.4,
+`reasoning_effort` 75.
+
+| Serve | Trial scores | Mean | SD |
+|---|---|--:|--:|
+| b12x W4A8 | 91, 89, 93 | 91.0 | 2.0 |
+| b12x bf16 | 90, 91, 90 | 90.3 | 0.6 |
+| DeepGEMM | 90, 90, 91 | 90.3 | 0.6 |
+| GLM-5.3-Flash, a different model for reference | 89, 94, 91 | 91.3 | 2.5 |
+
+Scenario counts run both ways. bf16 against W4A8 is 3 better, 5 worse and 80
+tied. Either b12x backend against DeepGEMM is 5 better, 6 worse and 77 tied.
+
+This benchmark cannot separate the three backends. The choice rests on speed and
+memory.
+
+### Needle recall
+
+Measured 2026-09-10 at the same 1,048,576 window, on the DeepGEMM backend.
+7 runs, 7 pass. The needle string was `COPPER-LANTERN-8315`. Depth is the
+fraction of the prompt the needle sits at. The rate column is prefill only.
 
 | Target | Depth | Prompt tokens | TTFT s | Prefill tok/s | Result |
 |--:|--:|--:|--:|--:|---|
@@ -115,13 +168,10 @@ prefill only.
 | 131,072 | 0.9 | 130,219 | 68.7 | 1895.8 | pass |
 | 262,144 | 0.5 | 260,119 | 164.3 | 1583.4 | pass |
 
-Those 7 ran on an earlier boot at the same flags. That image carried one extra
-patch, a KV-accounting logger, which changes no serving path. Its pool came out
-at 1,150,699 tokens and 5.55 GiB.
+That boot carried one extra patch, a KV-accounting logger, which changes no
+serving path. Its pool came out at 1,150,699 tokens and 5.55 GiB.
 
-No decode throughput was measured at this context.
-
-Verified output:
+### Verified output
 
 ```json
 {"model": "deepseek-v41-flash",
@@ -140,6 +190,88 @@ Engram read cost, measured cold against one rank's real 23.6 GiB shard:
 |--:|--:|--:|
 | 12 (the TP=4 decode load) | 1.13 | 3.4% |
 | 48 | 1.89 | 5.7% |
+
+### Earlier numbers at 16,384
+
+The eager against CUDA-graphs comparison was measured on 2026-09-10, at
+`--max-model-len 16384`, `--max-num-seqs 4`, and the DeepGEMM backend. Graphs
+were worth 1.15x there. Those figures do not compare with the tables above.
+They are kept in [docs/cuda-graphs.md](docs/cuda-graphs.md).
+
+## Findings
+
+Five results from the b12x work on 2026-09-11.
+
+### 1. `--moe-backend b12x` selects W4A8 on its own
+
+The bf16 variant needs `VLLM_B12X_MOE_FP4_FORCE_A16=1` as well. The selection
+sits in `vllm/model_executor/layers/fused_moe/oracle/mxfp4.py`, in
+`_get_requested_backends`. Its comment reads: "W4A8 is the high-throughput b12x
+path and is preferred when the model does not request an activation format."
+
+Check the head log. It prints `Using 'B12X_MXFP4_MXFP8' Mxfp4 MoE backend.` for
+W4A8 and `Using 'B12X_MXFP4_BF16' Mxfp4 MoE backend.` for bf16.
+
+### 2. The shipped b12x GB10 profile predates this model
+
+`b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz` in the image is dated
+2026-09-04. This model reached the fleet on 2026-09-10.
+
+The profile does not cover these shapes, so the serve logs a policy fallback:
+
+```
+b12x policy fallback: moe.decode is using a heuristic on nvidia gb10
+(compute capability 12.1, 48 SMs) because profile 'nvidia.gb10.48sm' does not
+cover the query; query={'activation': 'silu', 'hidden_size': 5120,
+'intermediate_size': 576, 'num_experts': 384, 'num_tokens': 8192,
+'quant_mode': 'w4a16', 'routed_rows': 49152, 'source_format': 'fp4_e8m0_k32',
+'top_k': 6}
+```
+
+The W4A8 serve logs the same fallback with `quant_mode: 'w4a8_mx'`. Every b12x
+number on this page therefore comes from the heuristic. No tuned profile covers
+these shapes.
+
+### 3. A docker `--memory` cap starves the KV pool at 1M
+
+b12x needs about 1.16 GiB more resident memory than DeepGEMM. With
+`--memory 112g` the 1M boot died:
+
+```
+ValueError: To serve at least one request with the model's max seq len
+(1048576), 3.42 GiB KV cache is needed, which is larger than the available KV
+cache memory (1.74 GiB). Based on the available memory, the estimated maximum
+model length is 491456.
+```
+
+DeepGEMM got 2.9 GiB under the same cap and died the same way. Uncapped, the
+DeepGEMM boot got 5.22 GiB and 1,372,132 KV tokens. The launcher now clears the
+cap above `CTX` 262144.
+
+### 4. b12x weight prep is sensitive to host memory fragmentation
+
+`_canonicalize_fp4_zero_signs_` in
+`vllm/model_executor/layers/fused_moe/b12x.py` makes 8 full-size uint8
+temporaries per MoE weight tensor. About 4 are live at once. Per rank per layer
+w13 is 1.06 GiB and w2 is 0.53 GiB, across 40 layers.
+
+On a box 10 weeks into its uptime, that prep took 870 s. Three identical nodes
+took 80 s, 85 s and 128 s. The slow node ran at 100% system time with the GPU at
+0%, at 190 memory compactions per second, of which 39% failed.
+
+The other three ranks then blocked in `broadcast_object_list`, inside
+`_init_message_queues`. That collective has no timeout. The boot presents as a
+hang, with every GPU at 2%.
+
+The fix is `drop_caches` plus `compact_memory` on all four boxes, between
+teardown and start, while the 81 GiB of weights is released. The launcher does
+this by default. Prep spread went from 10.9x to 1.08x, and the slow node came
+down to 88 s.
+
+### 5. The nearest published recipe stops at 300,000 context
+
+The nearest published recipe caps at `--max-model-len 300000`, and records that
+1M has not been re-run on that stack. The b12x tables above are at 1,048,576.
 
 ## Quickstart
 
@@ -163,8 +295,8 @@ DSPARK=5 ./launch/vlspeed-tp4-4node-up.sh                  # 1,048,576, the defa
 DSPARK=5 CTX=16384 ./launch/vlspeed-tp4-4node-up.sh        # 16,384
 ```
 
-The needle table and the 1M pool figures were measured at the first command.
-The speed table was measured at the second.
+The first command is the serve every table above was measured on. It defaults to
+the b12x bf16 backend, `--max-num-seqs 8` and no docker memory cap.
 
 The IP addresses in `launch/vlspeed-tp4-4node-up.sh` are RFC 5737 documentation
 ranges. Replace them with your own. Host paths use `$HOME`.
@@ -196,22 +328,23 @@ Three further documents cover the rest:
 
 ## Not proven
 
-State of the work on 2026-09-10. Nothing below was measured.
+State of the work on 2026-09-11. Nothing below was measured.
 
-- **Quality.** No benchmark and no evaluation run. No greedy reference, no
-  garble gate, no needle test. Four correct prompts do not measure quality.
+- **Quality outside tool use.** tool-eval-bench 2.6.1 scores the three backends
+  at 90.3 to 91.0 over 88 scenarios and 3 trials. Those scenarios are tool-use
+  tasks at short context. No long-context quality run, no greedy reference and
+  no garble gate.
 - **Engram hash ids.** The reader was verified against the checkpoint, and the
   staged rows were verified inside the serve. Both are below. Neither checks
   that the model computes the right row ids: `rolling % prime[h] + offset[h]`,
   the compressed token map, or `EngramLayout.offsets`. A wrong id reads a
   correct row and raises nothing.
 - **Context between 262,144 and 1,048,576.** The needle passed at 262,144. No
-  prompt above it was run, so the top of the declared window is unproven.
-- **Decode throughput at long context.** The speed table is 16,384 only. The
-  needle runs record prefill and TTFT.
+  prompt above it was run, so the top of the declared window is unproven. The
+  needle runs used the DeepGEMM backend. No needle was run on b12x.
 - **The `persistent_topk` failure mode.** `top_k_per_row_decode` was installed
   for every long-context run here, so nothing exercised the kernel it replaces.
-- **Concurrency above 4.** The bench ran 1, 2 and 4 streams.
+- **Concurrency above 8.** The bench ran 1, 2, 4, 6 and 8 streams.
 - **That every decode batch hit an exact FULL graph.** The capture sizes were
   derived. No per-batch trace confirmed them.
 - **DSpark k other than 5 and 10.**
